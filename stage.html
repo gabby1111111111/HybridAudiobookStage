@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>字幕舞台</title>
+    <link rel="stylesheet" href="./stage-window.css?v=20260707-window3">
+</head>
+<body>
+    <main id="stage" class="fit-contain">
+        <video id="video" autoplay loop muted playsinline></video>
+        <div id="shade"></div>
+        <div id="counter">0 / 0</div>
+        <button id="close" type="button" title="关闭">×</button>
+        <button id="fitSize" type="button" title="按视频尺寸调整窗口">▣</button>
+        <section id="subtitleBox" role="button" tabindex="0">
+            <div id="subtitle">没有字幕数据</div>
+        </section>
+        <nav id="controls">
+            <button id="prev" type="button" title="上一句">‹</button>
+            <button id="play" type="button" title="播放/暂停">▶</button>
+            <button id="next" type="button" title="下一句">›</button>
+        </nav>
+    </main>
+    <script src="./stage-window.js?v=20260707-window3"></script>
+</body>
+</html>

@@ -1,0 +1,18 @@
+.DS_Store
+Thumbs.db
+node_modules/
+.env
+.env.*
+*.log
+*.tmp
+*.bak
+
+# Local/generated audio and video samples
+*.wav
+*.mp3
+*.ogg
+*.webm
+*.mp4
+
+# Keep plugin asset directory without committing personal media.
+!assets/.gitkeep

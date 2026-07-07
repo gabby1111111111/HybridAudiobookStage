@@ -1,0 +1,11 @@
+{
+  "display_name": "🎧 混合有声书舞台",
+  "loading_order": 60,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "css": "style.css",
+  "author": "Gabby + Codex",
+  "version": "0.1.0",
+  "description": "支持纯有声书和视频字幕的 <content> 朗读舞台。"
+}
