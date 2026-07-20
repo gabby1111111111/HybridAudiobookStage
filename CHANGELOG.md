@@ -1,19 +1,59 @@
-# Changelog
+# 更新日志
+
+本项目的重要用户可见变更都会记录在这里。版本号遵循语义化版本规范。
 
 ## [Unreleased]
 
-### Added
-- Added mixed audiobook playback for `<content>` narration and tagged character dialogue.
-- Added floating video subtitle stage and compact pure audiobook player.
-- Added per-dialogue playback buttons and full-message playback controls.
-- Added SillyTavern server shared audio cache for multi-device reuse.
-- Added server proxy support for local IndexTTS2 API access from mobile browsers.
-- Added multi-device self-check for LAN address, shared cache read/write, Edge TTS, and IndexTTS2.
+## [0.2.0] - 2026-07-21
 
-### Changed
-- Kept large audio data out of shared settings; audio is stored in IndexedDB and optional server files.
-- Shared cache reads now bypass browser HTTP cache so server cache state is checked directly.
+### 新增
 
-### Fixed
-- Fixed long subtitle display by splitting text into pages instead of relying on truncation.
-- Fixed repeated playback issues by using one active audio element for the mixed queue.
+- 新增三步轻量 TTS：选择朗读方式、连接并试听、调整播放手感。
+- 新增旁白与角色分别朗读、只读角色台词、全文单音色三种朗读模式。
+- 新增命名 Provider Profile 和朗读方案，可为旁白、角色默认、全文及特定角色分别选择服务与音色。
+- 新增 Edge、OpenAI 兼容和豆包原生 Provider；IndexTTS2 作为 OpenAI 兼容 Profile 使用。
+- 新增独立实现的豆包 v3 单向 TTS 服务器代理、鉴权头转发、NDJSON 音频分片合并和 MP3 输出。
+- 新增豆包猫箱同款男声、女声音色目录，支持 `seed-tts-2.0` 与 `seed-icl-2.0`。
+- 新增完整 Edge 音色目录，优先显示简体中文男声和女声，其余音色保持来源顺序。
+- 新增 IndexTTS2 参考音频目录只读发现接口，可通过环境变量配置 `.wav` 音色目录。
+- 新增统一可搜索音色选择器，可按中文名、音色 ID、Locale、Gender、男声或女声过滤。
+- 新增每个 Profile 最近选择音色记录，切换 Provider 后不会串用其他服务的音色。
+- 新增全文、单句台词、选中文字、当前段落和 Profile 试听入口。
+- 新增可取消播放 Session、分段状态、顺序播放和最多两个后续分段预取。
+- 新增台词按钮生命周期：未缓存、准备中、可播放、正在播放和失败。
+- 新增浏览器内存缓存、IndexedDB 本地缓存和 SillyTavern 服务器共享缓存。
+- 新增隐私安全的合成缓存身份和本地缓存 LRU 上限。
+- 新增 PC/手机多端共享缓存、自检、统计、按上限清理和清空功能。
+- 新增轻量播放器、纯有声书模式、浮动视频字幕舞台和独立字幕窗口。
+- 新增完整中文 README 和轻量 TTS 使用指南。
+
+### 变更
+
+- 默认设置页改为渐进披露的轻量三步流程，高级 Provider、缓存、兼容项和旧视频舞台收进折叠区。
+- 消息工具栏保留日常朗读入口，预生成、检查和配置入口移动到“更多”菜单。
+- 旁白解析改为先识别角色台词，再从旁白区间扣除台词，避免重复朗读。
+- 单句、全文和精确选区统一使用相同路由元数据与缓存身份。
+- 缓存查找顺序统一为内存、IndexedDB、服务器共享缓存、Provider。
+- 合成语速与播放器倍速分离；第一段准备完成后立即播放。
+- 音量和播放器倍速不再让合成缓存失效。
+- 音色列表改为可读主名称和可换行次级信息，完整 ID 不再被窄下拉框裁切。
+- Markdown 显示标记在分段、缓存和合成前统一清理，`*文本*` 不再朗读星号。
+- 大型音频不写入 SillyTavern 共享设置；浏览器使用 IndexedDB，共享音频使用服务器用户文件。
+- 共享缓存读取绕过浏览器 HTTP 缓存，直接检查服务器真实状态。
+
+### 修复
+
+- 修复单句、全文和选区对相同文本重复调用 Provider 的问题。
+- 修复刷新页面后相同语音无法复用本机持久缓存的问题。
+- 修复台词按钮在缓存完成后仍显示耳机、重复点击同一句重新生成的问题。
+- 修复全文播放过程中点击单句或连续点击台词导致播放 Session 混乱的问题。
+- 修复旧 IndexTTS2 特定角色覆盖悄悄优先于新豆包角色默认路由的问题；新增明确警告和确认清理入口。
+- 修复可见 Edge Profile 被错误送入 OpenAI 兼容连接验证的问题，并保守修复异常迁移记录。
+- 修复取消后旧请求晚到并重新播放的问题。
+- 修复长字幕依赖截断的问题，改为可翻页显示。
+- 修复混合队列使用多个音频实例导致的重复播放问题。
+- 修复音色下拉框只露出 `Neural` 等尾部残片的问题。
+- 修复 Markdown 星号、加粗、删除线和反引号进入朗读文本的问题。
+
+[Unreleased]: https://github.com/gabby1111111111/HybridAudiobookStage/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/gabby1111111111/HybridAudiobookStage/releases/tag/v0.2.0

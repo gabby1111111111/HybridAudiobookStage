@@ -8,10 +8,68 @@ import {
     event_types,
     getRequestHeaders,
 } from '../../../../script.js';
+import {
+    DOUBAO_NATIVE_PROFILE_ID,
+    ensureTtsSettingsV2,
+    LEGACY_EDGE_PROFILE_ID,
+    LEGACY_OPENAI_PROFILE_ID,
+} from './public/lib/tts-settings.mjs';
+import {
+    collectTextSegments,
+    extractContentBlock as extractTtsContentBlock,
+    normalizeWhitespace as normalizeTtsWhitespace,
+    parseDialogueLine as parseTtsDialogueLine,
+    splitNarrationText as splitTtsNarrationText,
+} from './public/lib/tts-text.mjs';
+import { createProviderRegistry } from './public/lib/tts-providers.mjs';
+import {
+    applyPresetRouting,
+    removeCharacterOverridesByProfile,
+    resolveSegmentRoute,
+    summarizeCharacterOverrides,
+} from './public/lib/tts-routing.mjs';
+import { createPlaybackSessionManager } from './public/lib/playback-session.mjs';
+import { getInlineDialogueButtonPresentation } from './public/lib/inline-dialogue-button.mjs';
+import { buildSynthesisDescriptor, chooseLruEvictions, stableSerialize } from './public/lib/tts-cache-key.mjs';
+import { beginTtsAuditRun, createTtsAuditState } from './public/lib/tts-audit.mjs';
+import { createAudioMemoryCache, findAudioCacheHit } from './public/lib/tts-memory-cache.mjs';
+import {
+    chooseProfileVoice,
+    collectProfileVoiceOptions,
+    matchesVoiceSearch,
+    rememberProfileVoice,
+} from './public/lib/tts-voice-options.mjs';
+import {
+    DOUBAO_CATBOX_VOICE_GROUPS,
+    DOUBAO_ICL_RESOURCE_ID,
+    getDoubaoCatboxVoice,
+    isDoubaoCatboxVoice,
+} from './public/lib/doubao-voice-catalog.mjs';
+import {
+    getEdgeCatalogVoice,
+    getPrioritizedEdgeVoiceGroups,
+} from './public/lib/edge-voice-catalog.mjs';
 
 const extensionName = 'HybridAudiobookStage';
+const integrationEvents = {
+    speak: 'hybrid-audiobook:speak',
+    stop: 'hybrid-audiobook:stop',
+    segmentChanged: 'hybrid-audiobook:segment-changed',
+    playbackState: 'hybrid-audiobook:playback-state',
+};
 const audioDbName = 'HybridAudiobookStageAudioCache';
 const audioStoreName = 'audios';
+const fallbackIndexTtsVoiceCatalog = ['Nanami.wav', 'QinChe.wav', 'zjx.wav'];
+let indexTtsVoiceCatalog = [...fallbackIndexTtsVoiceCatalog];
+
+function getAudit() {
+    window.__hybridAudiobookStageAudit ||= createTtsAuditState();
+    return window.__hybridAudiobookStageAudit;
+}
+
+function beginAuditRun(action) {
+    return beginTtsAuditRun(getAudit(), action);
+}
 
 const defaultSettings = {
     enabled: true,
@@ -58,14 +116,99 @@ let stageState = {
 
 let pipState = null;
 let audioDbPromise = null;
+const audioMemoryCache = createAudioMemoryCache();
 let currentPlayback = {
     audio: null,
     controller: null,
     playlist: [],
     index: 0,
     sessionId: 0,
+    session: null,
     msg: null,
 };
+
+let latestTextSelection = { text: '', paragraphText: '', messageId: '', msg: null };
+const inlineDialogueButtonStates = new Map();
+
+function getInlineDialogueButtonKey(msg, dialogueIndex) {
+    return `${getMessageId(msg)}:${Number(dialogueIndex) || 0}`;
+}
+
+function setInlineDialogueButtonState(key, state, {
+    cacheReady = undefined,
+    cacheHash = undefined,
+    cacheChecked = undefined,
+    error = null,
+} = {}) {
+    if (!key) return;
+    const previous = inlineDialogueButtonStates.get(key) || { state: 'idle', cacheReady: false };
+    const next = {
+        state,
+        cacheReady: cacheReady === undefined ? previous.cacheReady : !!cacheReady,
+        cacheHash: cacheHash === undefined ? previous.cacheHash : cacheHash,
+        cacheChecked: cacheChecked === undefined ? previous.cacheChecked : !!cacheChecked,
+    };
+    inlineDialogueButtonStates.set(key, next);
+    const presentation = getInlineDialogueButtonPresentation(state);
+    document.querySelectorAll('.has-inline-dialogue-button').forEach(button => {
+        if (button.dataset.dialogueKey !== key) return;
+        button.dataset.state = state;
+        button.classList.toggle('has-busy', presentation.busy);
+        button.classList.toggle('has-playing', state === 'playing');
+        button.setAttribute('aria-busy', String(presentation.busy));
+        button.setAttribute('aria-pressed', String(presentation.pressed));
+        button.setAttribute('aria-label', presentation.label);
+        button.title = presentation.label;
+        button.innerHTML = `<i class="${presentation.iconClass}" aria-hidden="true"></i>`;
+    });
+    Object.assign(getAudit().inline_button ||= {}, {
+        status: error ? 'fail' : 'success',
+        error: error ? String(error).slice(0, 200) : null,
+        state,
+        cache_ready: next.cacheReady,
+    });
+}
+
+const playbackSessions = createPlaybackSessionManager({
+    onCancel: ({ session, abortCount, reason }) => {
+        Object.assign(getAudit().request_cancelled, {
+            status: 'success', error: null, abort_count: abortCount, stale_result_blocked: true,
+        });
+        emitPlaybackState(session, 'cancelled', reason || null);
+    },
+});
+
+function emitPlaybackState(session, status, error = null) {
+    if (!session) return;
+    eventSource?.emit?.(integrationEvents.playbackState, {
+        sessionId: session.id,
+        status,
+        index: Number(session.currentIndex || 0),
+        total: session.segments?.length || 0,
+        error: error ? String(error).slice(0, 300) : null,
+    });
+}
+
+function emitSegmentChanged(session, index) {
+    const segment = session?.segments?.[index];
+    if (!session || !segment) return;
+    eventSource?.emit?.(integrationEvents.segmentChanged, {
+        sessionId: session.id,
+        index,
+        total: session.segments.length,
+        type: segment.type || 'single',
+        character: segment.character || '',
+        status: segment.synthesisStatus || 'idle',
+    });
+}
+
+const providerRegistry = createProviderRegistry({
+    getSillyTavernHeaders: () => {
+        const headers = getRequestHeaders ? getRequestHeaders() : {};
+        headers['Content-Type'] = 'application/json';
+        return headers;
+    },
+});
 
 function getSettings() {
     extension_settings[extensionName] ||= {};
@@ -77,6 +220,22 @@ function getSettings() {
     }
     if (!settings.voiceMap || typeof settings.voiceMap !== 'object' || Array.isArray(settings.voiceMap)) {
         settings.voiceMap = {};
+    }
+    try {
+        const migration = ensureTtsSettingsV2(settings);
+        Object.assign(getAudit().settings_migrated, {
+            status: 'success',
+            error: null,
+            profile_count: migration.profileCount,
+            preset_count: migration.presetCount,
+        });
+        if (migration.changed) saveSettingsDebounced?.();
+    } catch (error) {
+        Object.assign(getAudit().settings_migrated, {
+            status: 'fail',
+            error: error?.message || String(error),
+        });
+        getAudit().last_error = error?.message || String(error);
     }
     if (settings.ttsSyncAutoAdvanceMigrated !== true) {
         settings.autoAdvance = false;
@@ -193,6 +352,35 @@ async function checkIndexTtsApi({ silent = false } = {}) {
         setServiceStatus(statusId, `IndexTTS2 未连接：${error.message}。请点击“启动 API”或手动运行启动脚本。`, 'bad');
         if (!silent) toastWarn('IndexTTS2 API 还没启动');
         return false;
+    }
+}
+
+async function loadIndexTtsVoiceCatalog(container = document.getElementById('has-settings')) {
+    try {
+        const response = await fetch('/api/plugins/hybrid-audiobook-stage/index-tts2/voices', {
+            method: 'GET',
+            headers: getRequestHeaders ? getRequestHeaders() : {},
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        const voices = Array.from(new Set((Array.isArray(data?.voices) ? data.voices : [])
+            .map(value => String(value || '').trim())
+            .filter(value => value && /\.wav$/i.test(value))));
+        if (!voices.length) throw new Error('ckyp 文件夹里没有 WAV 音色');
+        indexTtsVoiceCatalog = voices;
+        Object.assign(getAudit().index_voice_catalog ||= {}, {
+            status: 'success', error: null, count: voices.length, source: 'server-directory',
+        });
+        renderTtsConfiguration(container);
+        return voices;
+    } catch (error) {
+        indexTtsVoiceCatalog = [...fallbackIndexTtsVoiceCatalog];
+        Object.assign(getAudit().index_voice_catalog ||= {}, {
+            status: 'fail', error: String(error.message || error).slice(0, 160),
+            count: indexTtsVoiceCatalog.length, source: 'bundled-fallback',
+        });
+        renderTtsConfiguration(container);
+        return indexTtsVoiceCatalog;
     }
 }
 
@@ -342,26 +530,11 @@ async function runMultiDeviceSelfCheck() {
 }
 
 function normalizeWhitespace(text) {
-    return String(text || '')
-        .replace(/\r/g, '')
-        .replace(/[ \t]+\n/g, '\n')
-        .replace(/\n{3,}/g, '\n\n')
-        .trim();
+    return normalizeTtsWhitespace(text);
 }
 
 function extractContentBlock(text) {
-    const source = String(text || '');
-    const match = source.match(/<content\b[^>]*>([\s\S]*?)<\/content>/i);
-    if (!match) return '';
-
-    return normalizeWhitespace(match[1]
-        .replace(/<br\s*\/?>/gi, '\n')
-        .replace(/<\/(p|div|section|article|li|h[1-6])>/gi, '\n')
-        .replace(/<[^>]+>/g, '')
-        .replace(/&nbsp;/gi, ' ')
-        .replace(/&lt;/gi, '<')
-        .replace(/&gt;/gi, '>')
-        .replace(/&amp;/gi, '&'));
+    return extractTtsContentBlock(text);
 }
 
 function getMessageId(msg) {
@@ -398,86 +571,49 @@ function getLastContentMessageText() {
 }
 
 function parseDialogueLine(line) {
-    const trimmed = String(line || '').trim().replace(/\s+/g, ' ');
-    if (!trimmed) return null;
-    const match = trimmed.match(/^\[([^\]|\n]+)(?:\|([^\]\n]*))?\](?:\[([\d.,\s-]+)\])?\s*\|\s*([「“"](.*?)[」”"])\s*$/);
-    if (!match) return null;
-
-    const character = (match[1] || '').trim();
-    const emotionLabel = (match[2] || '').trim();
-    const emotion = match[3] ? match[3].replace(/\s/g, '') : null;
-    const rawContent = (match[4] || '').trim();
-    const text = (match[5] || '').trim();
-    if (!character || !text) return null;
-    return { character, emotionLabel, emotion, rawContent, text };
+    return parseTtsDialogueLine(line);
 }
 
 function splitNarrationText(text) {
-    const normalized = normalizeWhitespace(text).replace(/[ \t]+/g, ' ');
-    if (!normalized) return [];
-
-    const chunks = [];
-    for (const paragraph of normalized.split(/\n+/)) {
-        let buffer = '';
-        for (const char of paragraph.trim()) {
-            buffer += char;
-            if (/[。！？；!?;]/.test(char)) {
-                chunks.push(buffer.trim());
-                buffer = '';
-            }
-        }
-        if (buffer.trim()) chunks.push(buffer.trim());
-    }
-    return chunks.filter(Boolean);
+    return splitTtsNarrationText(text);
 }
 
 function collectSegmentsFromText(rawText) {
-    const content = extractContentBlock(rawText);
-    if (!content) return { hasContent: false, content: '', segments: [], cacheKey: '' };
-
     const settings = getSettings();
-    const segments = [];
-    let narration = [];
-
-    const flushNarration = () => {
-        const text = narration.join('\n');
-        narration = [];
-        for (const chunk of splitNarrationText(text)) {
-            segments.push({
-                engine: 'edge',
-                type: 'narration',
-                text: chunk,
-                character: 'Narrator',
-            });
-        }
-    };
-
-    for (const line of content.split('\n')) {
-        const trimmed = line.trim();
-        if (!trimmed) {
-            if (narration.length && narration[narration.length - 1] !== '') narration.push('');
-            continue;
-        }
-
-        const parsed = parseDialogueLine(trimmed);
-        if (parsed) {
-            flushNarration();
-            segments.push({
-                engine: 'index',
-                type: 'dialogue',
-                text: parsed.text,
-                rawContent: parsed.rawContent,
-                character: parsed.character,
-                emotionLabel: parsed.emotionLabel,
-                emotion: parsed.emotion,
-                voice: settings.voiceMap[parsed.character] || '',
-                originalLine: trimmed,
-            });
-        } else {
-            narration.push(trimmed);
-        }
+    const preset = settings.routingPresets?.[settings.activeRoutingPresetId] || {};
+    const mode = ['mixed', 'dialogue-only', 'single-voice'].includes(preset.mode)
+        ? preset.mode
+        : (settings.readNarration === false ? 'dialogue-only' : 'mixed');
+    const parsed = collectTextSegments(rawText, { mode });
+    if (!parsed.hasContent) {
+        Object.assign(getAudit().content_extracted, { status: 'fail', error: 'content_not_found', content_found: false });
+        return { hasContent: false, content: '', segments: [], cacheKey: '' };
     }
-    flushNarration();
+    const { content } = parsed;
+    const legacySegments = parsed.segments.map(segment => ({
+        ...segment,
+        engine: segment.type === 'narration' ? 'edge' : 'index',
+        voice: segment.type === 'dialogue' ? (settings.voiceMap[segment.character] || '') : '',
+    }));
+    const routed = applyPresetRouting(legacySegments, preset, settings.providerProfiles);
+    let dialogueIndex = 0;
+    const segments = routed.segments.map(segment => segment.type === 'dialogue'
+        ? { ...segment, dialogueIndex: dialogueIndex++ }
+        : segment);
+
+    const narrationCount = segments.filter(segment => segment.type === 'narration').length;
+    const dialogueCount = segments.filter(segment => segment.type === 'dialogue').length;
+    Object.assign(getAudit().content_extracted, { status: 'success', error: null, content_found: true });
+    Object.assign(getAudit().route_built, {
+        status: 'success',
+        error: null,
+        mode,
+        narration_count: narrationCount,
+        dialogue_count: dialogueCount,
+        unresolved_count: routed.unresolved.length,
+        override_count: summarizeCharacterOverrides(preset).total,
+        legacy_index_override_count: summarizeCharacterOverrides(preset, LEGACY_OPENAI_PROFILE_ID).matchingProfile,
+    });
 
     const cacheKey = simpleStringHash(JSON.stringify({
         content,
@@ -570,6 +706,7 @@ function getCurrentPlaybackTitle() {
 
 function getCacheSourceLabel(item = currentPlayback.playlist?.[currentPlayback.index]) {
     const source = String(item?.cacheSource || '').toLowerCase();
+    if (source === 'memory') return '即时缓存';
     if (source === 'server') return '服务器缓存';
     if (source === 'indexeddb') return '本机缓存';
     if (source === 'generated') return '新生成';
@@ -605,6 +742,7 @@ function ensureAudioPlayer() {
             <div class="has-player-info">
                 <div class="has-player-charname" id="has-player-title">旁白</div>
                 <div class="has-player-text"><span class="has-player-text-inner" id="has-player-text">准备播放...</span></div>
+                <div class="has-player-status" id="has-player-status">等待生成</div>
             </div>
             <div class="has-player-speed-area">
                 <div class="has-player-speed-btn" id="has-player-speed" title="点击切换倍速">1.0x</div>
@@ -635,9 +773,9 @@ function ensureAudioPlayer() {
     root.querySelector('#has-player-progress').addEventListener('input', event => currentPlayback.controller?.seek?.(Number(event.target.value) / 1000));
     root.querySelector('#has-player-speed').addEventListener('click', () => {
         const cycle = [0.5, 1, 1.25, 1.5, 2, 3];
-        const current = Number(getSettings().speed || 1);
+        const current = Number(getSettings().playbackRate || 1);
         const next = cycle.find(value => value > current + 0.01) || cycle[0];
-        getSettings().speed = next;
+        getSettings().playbackRate = next;
         saveSettings();
         if (currentPlayback.audio) currentPlayback.audio.playbackRate = next;
         renderAudioPlayer();
@@ -674,6 +812,7 @@ function renderAudioPlayer() {
     const timeLeft = root.querySelector('#has-player-time-left');
     const speed = root.querySelector('#has-player-speed');
     const volume = root.querySelector('#has-player-volume i');
+    const status = root.querySelector('#has-player-status');
     if (title) {
         const sourceLabel = getCacheSourceLabel();
         title.textContent = `${speaker} · ${currentPlayback.index + 1 || 0} / ${currentPlayback.playlist.length || stageState.segments.length || 0}${sourceLabel ? ` · ${sourceLabel}` : ''}`;
@@ -696,11 +835,24 @@ function renderAudioPlayer() {
     const duration = Number(activeAudio?.duration || currentPlayback.playlist?.[currentPlayback.index]?.duration || 0);
     if (timeCurrent) timeCurrent.textContent = formatTime(current);
     if (timeLeft) timeLeft.textContent = `-${formatTime(Math.max(0, duration - current))}`;
-    if (speed) speed.textContent = `${Number(getSettings().speed || 1).toFixed(1)}x`;
+    if (speed) speed.textContent = `${Number(getSettings().playbackRate || 1).toFixed(1)}x`;
     if (volume) {
         const vol = Number(getSettings().volume || 0);
         volume.className = vol === 0 ? 'fa-solid fa-volume-xmark' : (vol < 0.5 ? 'fa-solid fa-volume-low' : 'fa-solid fa-volume-high');
     }
+    if (status) {
+        const session = currentPlayback.session;
+        const segment = session?.segments?.[currentPlayback.index];
+        const pendingCount = session?.segments?.filter(item => item.synthesisStatus === 'pending').length || 0;
+        const label = segment?.synthesisStatus === 'pending' ? '正在生成当前段'
+            : segment?.synthesisStatus === 'error' ? '当前段生成失败'
+                : stageState.playing ? '正在播放' : (session?.status === 'completed' ? '播放完成' : '已暂停');
+        status.textContent = pendingCount ? `${label} · 预取 ${pendingCount}` : label;
+    }
+    Object.assign(getAudit().player_ready, {
+        status: 'success', error: null, ui_mode: stageState.uiMode || 'player', controls_ready: true,
+        playback_rate: Number(getSettings().playbackRate || 1),
+    });
 }
 
 function setupAudioPlayerDrag(root, handle) {
@@ -752,7 +904,7 @@ async function sha256(value) {
 function openAudioDb() {
     if (audioDbPromise) return audioDbPromise;
     audioDbPromise = new Promise((resolve, reject) => {
-        const request = indexedDB.open(audioDbName, 1);
+        const request = indexedDB.open(audioDbName, 2);
         request.onupgradeneeded = () => {
             const db = request.result;
             if (!db.objectStoreNames.contains(audioStoreName)) {
@@ -768,21 +920,102 @@ function openAudioDb() {
 async function getCachedAudio(hash) {
     const db = await openAudioDb();
     return new Promise((resolve, reject) => {
-        const tx = db.transaction(audioStoreName, 'readonly');
-        const req = tx.objectStore(audioStoreName).get(hash);
-        req.onsuccess = () => resolve(req.result || null);
+        const tx = db.transaction(audioStoreName, 'readwrite');
+        const store = tx.objectStore(audioStoreName);
+        const req = store.get(hash);
+        req.onsuccess = () => {
+            const record = req.result || null;
+            if (record) {
+                record.lastAccessedAt = Date.now();
+                record.size = Number(record.size || record.blob?.size || 0);
+                store.put(record);
+            }
+            resolve(record);
+        };
         req.onerror = () => reject(req.error);
     });
+}
+
+async function hasLocalCachedAudio(hash) {
+    if (audioMemoryCache.has(hash)) return true;
+    const db = await openAudioDb();
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(audioStoreName, 'readonly');
+        const req = tx.objectStore(audioStoreName).getKey(hash);
+        req.onsuccess = () => resolve(req.result !== undefined);
+        req.onerror = () => reject(req.error);
+    });
+}
+
+async function verifyServerCachedAudio(hashes, signal = undefined) {
+    const uniqueHashes = [...new Set((hashes || []).filter(Boolean))];
+    if (!uniqueHashes.length || getSettings().sharedAudioCacheEnabled === false) return {};
+    const headers = getRequestHeaders ? getRequestHeaders() : {};
+    headers['Content-Type'] = 'application/json';
+    const response = await fetch('/api/plugins/hybrid-audiobook-stage/audio-cache/verify', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ hashes: uniqueHashes }),
+        signal,
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const payload = await response.json();
+    return payload?.result && typeof payload.result === 'object' ? payload.result : {};
 }
 
 async function saveCachedAudio(record) {
     const db = await openAudioDb();
     return new Promise((resolve, reject) => {
         const tx = db.transaction(audioStoreName, 'readwrite');
-        tx.objectStore(audioStoreName).put(record);
+        tx.objectStore(audioStoreName).put({
+            ...record,
+            size: Number(record.size || record.blob?.size || 0),
+            lastAccessedAt: Date.now(),
+        });
         tx.oncomplete = () => resolve(true);
         tx.onerror = () => reject(tx.error);
     });
+}
+
+function toPersistentAudioRecord(record) {
+    if (!record || !record.blob) return null;
+    const { blobUrl: _blobUrl, cacheSource: _cacheSource, isCached: _isCached, ...persistent } = record;
+    return {
+        ...persistent,
+        size: Number(persistent.size || persistent.blob?.size || 0),
+    };
+}
+
+function materializeAudioRecord(record, cacheSource, fallbackMeta = {}) {
+    const persistent = toPersistentAudioRecord({ ...fallbackMeta, ...record });
+    if (!persistent) return null;
+    audioMemoryCache.set(persistent.hash, persistent);
+    return {
+        ...persistent,
+        blobUrl: URL.createObjectURL(persistent.blob),
+        isCached: cacheSource !== 'generated',
+        cacheSource,
+    };
+}
+
+async function pruneLocalAudioCache() {
+    const db = await openAudioDb();
+    const records = await new Promise((resolve, reject) => {
+        const request = db.transaction(audioStoreName, 'readonly').objectStore(audioStoreName).getAll();
+        request.onsuccess = () => resolve(request.result || []);
+        request.onerror = () => reject(request.error);
+    });
+    const maxBytes = Math.max(32, Math.min(10240, Number(getSettings().localAudioCacheMaxMb) || 512)) * 1024 * 1024;
+    const result = chooseLruEvictions(records, maxBytes);
+    if (!result.evictions.length) return result;
+    await new Promise((resolve, reject) => {
+        const tx = db.transaction(audioStoreName, 'readwrite');
+        const store = tx.objectStore(audioStoreName);
+        result.evictions.forEach(hash => store.delete(hash));
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+    });
+    return result;
 }
 
 function getAudioExtensionFromBlob(blob) {
@@ -802,12 +1035,13 @@ function blobToBase64(blob) {
     });
 }
 
-async function getServerCachedAudio(hash, fallbackMeta = {}) {
+async function getServerCachedAudio(hash, fallbackMeta = {}, signal = undefined) {
     if (getSettings().sharedAudioCacheEnabled === false) return null;
     try {
         const response = await fetch(`/api/plugins/hybrid-audiobook-stage/audio-cache/${encodeURIComponent(hash)}`, {
             method: 'GET',
             cache: 'no-store',
+            signal,
         });
         if (response.status === 404) return null;
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -816,14 +1050,33 @@ async function getServerCachedAudio(hash, fallbackMeta = {}) {
             ...fallbackMeta,
             hash,
             blob,
-            blobUrl: URL.createObjectURL(blob),
-            isCached: true,
-            cacheSource: 'server',
         };
     } catch (error) {
+        if (error?.name === 'AbortError') throw error;
         console.warn(`[${extensionName}] shared cache read failed`, error);
         return null;
     }
+}
+
+async function findCachedAudio(hash, fallbackMeta = {}, signal = undefined) {
+    const hit = await findAudioCacheHit({
+        hash,
+        memoryCache: audioMemoryCache,
+        readIndexedDb: () => getCachedAudio(hash).catch(error => {
+            console.warn(`[${extensionName}] local cache read failed`, error);
+            return null;
+        }),
+        readServer: () => getServerCachedAudio(hash, fallbackMeta, signal),
+    });
+    if (!hit?.record?.blob) return null;
+
+    const persistent = toPersistentAudioRecord(hit.record);
+    if (hit.source === 'indexeddb') {
+        uploadServerCachedAudio(persistent).catch(error => console.warn(`[${extensionName}] cache promotion failed`, error));
+    } else if (hit.source === 'server') {
+        saveCachedAudio(persistent).then(pruneLocalAudioCache).catch(error => console.warn(`[${extensionName}] server cache local save failed`, error));
+    }
+    return materializeAudioRecord(persistent, hit.source, fallbackMeta);
 }
 
 async function uploadServerCachedAudio(record) {
@@ -844,8 +1097,7 @@ async function uploadServerCachedAudio(record) {
                 maxCacheMb: normalizeCacheLimitMb(settings.sharedAudioCacheMaxMb),
                 meta: {
                     engine: record.engine,
-                    type: record.type,
-                    character: record.character,
+                    profileId: record.profileId,
                     voice: record.voice,
                 },
             }),
@@ -911,194 +1163,233 @@ async function clearLocalAudioCache() {
     return new Promise((resolve, reject) => {
         const tx = db.transaction(audioStoreName, 'readwrite');
         const req = tx.objectStore(audioStoreName).clear();
-        req.onsuccess = () => resolve(true);
+        req.onsuccess = () => {
+            audioMemoryCache.clear();
+            resolve(true);
+        };
         req.onerror = () => reject(req.error);
     });
 }
 
-async function fetchIndexTtsAudio(payload) {
-    const settings = getSettings();
-    if (settings.useServerIndexTtsProxy !== false) {
-        try {
-            const headers = getRequestHeaders ? getRequestHeaders() : {};
-            headers['Content-Type'] = 'application/json';
-            const response = await fetch('/api/plugins/hybrid-audiobook-stage/index-tts2/proxy', {
-                method: 'POST',
-                headers,
-                body: JSON.stringify({
-                    apiUrl: settings.ttsApiUrl,
-                    payload,
-                }),
-            });
-            if (!response.ok) {
-                const errorText = await response.text().catch(() => '');
-                throw new Error(`IndexTTS2 代理 HTTP ${response.status} ${errorText || response.statusText || ''}`.trim());
-            }
-            return response.blob();
-        } catch (error) {
-            console.warn(`[${extensionName}] IndexTTS2 proxy failed`, error);
-            if (settings.useServerIndexTtsProxy === true) {
-                throw error;
-            }
-        }
-    }
-
-    const response = await fetch(settings.ttsApiUrl, {
-        method: 'POST',
-        mode: 'cors',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-    });
-
-    if (!response.ok) {
-        const errorText = await response.text().catch(() => '');
-        throw new Error(`IndexTTS2 HTTP ${response.status} ${errorText || response.statusText || ''}`.trim());
-    }
-
-    return response.blob();
+function getProviderProfile(profileId, type, fallbackId) {
+    const profiles = getSettings().providerProfiles || {};
+    const requested = profiles[profileId];
+    if (requested?.type === type) return requested;
+    const fallback = profiles[fallbackId];
+    if (fallback?.type === type) return fallback;
+    return Object.values(profiles).find(profile => profile?.type === type && profile.enabled !== false) || null;
 }
 
-async function ensureIndexAudio(segment) {
+async function buildIndexAudioCacheIdentity(segment) {
     const settings = getSettings();
-    const voice = ensureWavSuffix(segment.voice || settings.defaultVoice);
-    const speed = Number(settings.speed || 1) || 1;
-    const volume = Number(settings.volume || 1) || 1;
-    const hash = await sha256(JSON.stringify({
-        engine: 'index',
-        api: settings.ttsApiUrl,
-        model: settings.ttsModel,
+    const preset = settings.routingPresets?.[settings.activeRoutingPresetId] || {};
+    const profile = getProviderProfile(segment.profileId || preset.dialogueDefault?.profileId, 'openai-compatible', LEGACY_OPENAI_PROFILE_ID);
+    if (!profile) throw new Error('没有可用的 OpenAI 兼容 TTS Profile');
+    const rawVoice = String(segment.voiceId || segment.voice || preset.dialogueDefault?.voiceId || profile.defaultVoice || settings.defaultVoice || '').trim();
+    const voice = profile.id === LEGACY_OPENAI_PROFILE_ID ? ensureWavSuffix(rawVoice) : rawVoice;
+    const speed = Number(settings.synthesisSpeed || 1) || 1;
+    const cacheDescriptor = buildSynthesisDescriptor({
+        providerType: profile.type,
+        profileId: profile.id,
+        endpoint: profile.endpoint,
+        model: profile.model,
         text: segment.text,
-        character: segment.character,
-        voice,
-        speed,
-        volume,
-        emotion: segment.emotion || '',
-    }));
+        voiceId: voice,
+        responseFormat: profile.responseFormat || 'wav',
+        synthesisParams: { speed },
+        extraBody: { ...(profile.extraBody || {}), emotion: segment.emotion || '' },
+    });
+    const hash = await sha256(stableSerialize(cacheDescriptor));
     const baseMeta = {
-        engine: 'index',
-        type: 'dialogue',
+        engine: profile.type,
+        profileId: profile.id,
+        type: segment.type || 'dialogue',
         text: segment.text,
-        character: segment.character,
+        character: segment.character || '',
         voice,
         speed,
-        volume,
         emotion: segment.emotion || '',
         timestamp: Date.now(),
     };
+    return { settings, profile, voice, speed, hash, baseMeta };
+}
 
-    const serverCached = await getServerCachedAudio(hash, baseMeta);
-    if (serverCached?.blob) return serverCached;
+async function ensureIndexAudio(segment, { signal } = {}) {
+    const { profile, voice, speed, hash, baseMeta } = await buildIndexAudioCacheIdentity(segment);
 
-    const cached = await getCachedAudio(hash).catch(() => null);
-    if (cached?.blob) {
-        uploadServerCachedAudio(cached).catch(error => console.warn(`[${extensionName}] cache promotion failed`, error));
-        return {
-            ...cached,
-            blobUrl: URL.createObjectURL(cached.blob),
-            isCached: true,
-            cacheSource: 'indexeddb',
-        };
-    }
+    const cached = await findCachedAudio(hash, baseMeta, signal);
+    if (cached?.blob) return cached;
 
     const payload = {
-        model: settings.ttsModel,
-        input: segment.text,
-        voice,
-        response_format: 'wav',
-        speed,
+        text: segment.text,
+        voiceId: voice,
+        model: profile.model,
+        responseFormat: profile.responseFormat || 'wav',
+        synthesisParams: { speed },
+        extraBody: {},
+        signal,
     };
 
     if (segment.emotion) {
         const emoVec = segment.emotion.split(',').map(value => Number.parseFloat(value.trim()));
         if (emoVec.length === 8 && emoVec.every(value => Number.isFinite(value))) {
-            payload.emo_control_method = 2;
-            payload.emo_vec = emoVec;
-            payload.emo_weight = 0.6;
+            payload.extraBody.emo_control_method = 2;
+            payload.extraBody.emo_vec = emoVec;
+            payload.extraBody.emo_weight = 0.6;
         }
     }
 
-    const blob = await fetchIndexTtsAudio(payload);
+    const synthesis = await providerRegistry.synthesize(profile, payload);
+    const blob = synthesis.blob;
+    Object.assign(getAudit().provider_ready, {
+        status: 'success', error: null, profile_id: profile.id, provider_type: profile.type, probe_ok: true,
+    });
     const record = {
         hash,
         ...baseMeta,
         blob,
         timestamp: Date.now(),
     };
-    saveCachedAudio(record).catch(error => console.warn(`[${extensionName}] cache save failed`, error));
+    await saveCachedAudio(record);
+    record.localPersisted = true;
+    pruneLocalAudioCache().catch(error => console.warn(`[${extensionName}] cache prune failed`, error));
     uploadServerCachedAudio(record).catch(error => console.warn(`[${extensionName}] shared cache save failed`, error));
-    return {
-        ...record,
-        blobUrl: URL.createObjectURL(blob),
-        isCached: false,
-        cacheSource: 'generated',
-    };
+    return materializeAudioRecord(record, 'generated');
 }
 
-async function ensureEdgeAudio(segment) {
+async function buildEdgeAudioCacheIdentity(segment) {
     const settings = getSettings();
+    const preset = settings.routingPresets?.[settings.activeRoutingPresetId] || {};
+    const profile = getProviderProfile(segment.profileId || preset.narration?.profileId, 'edge', LEGACY_EDGE_PROFILE_ID);
+    if (!profile) throw new Error('没有可用的 Edge TTS Profile');
     const text = String(segment.text || '').trim();
-    const voice = String(settings.edgeVoice || defaultSettings.edgeVoice).trim();
-    const rate = 0;
-    const hash = await sha256(JSON.stringify({
-        engine: 'edge',
+    const voice = String(segment.voiceId || preset.narration?.voiceId || profile.edgeVoice || settings.edgeVoice || defaultSettings.edgeVoice).trim();
+    const rate = Number(profile.edgeRate) || 0;
+    const cacheDescriptor = buildSynthesisDescriptor({
+        providerType: 'edge',
+        profileId: profile.id,
         text,
-        voice,
-        rate,
-        volume: settings.volume,
-    }));
+        voiceId: voice,
+        model: 'edge-tts',
+        responseFormat: 'audio',
+        synthesisParams: { rate },
+    });
+    const hash = await sha256(stableSerialize(cacheDescriptor));
     const baseMeta = {
         engine: 'edge',
-        type: 'narration',
+        profileId: profile.id,
+        type: segment.type || 'narration',
         text,
-        character: 'Narrator',
+        character: segment.character || 'Narrator',
         voice,
         rate,
-        volume: settings.volume,
         timestamp: Date.now(),
     };
+    return { profile, text, voice, rate, hash, baseMeta };
+}
 
-    const serverCached = await getServerCachedAudio(hash, baseMeta);
-    if (serverCached?.blob) return serverCached;
+async function ensureEdgeAudio(segment, { signal } = {}) {
+    const { profile, text, voice, rate, hash, baseMeta } = await buildEdgeAudioCacheIdentity(segment);
 
-    const cached = await getCachedAudio(hash).catch(() => null);
-    if (cached?.blob) {
-        uploadServerCachedAudio(cached).catch(error => console.warn(`[${extensionName}] edge cache promotion failed`, error));
-        return {
-            ...cached,
-            blobUrl: URL.createObjectURL(cached.blob),
-            isCached: true,
-            cacheSource: 'indexeddb',
-        };
-    }
+    const cached = await findCachedAudio(hash, baseMeta, signal);
+    if (cached?.blob) return cached;
 
-    const headers = getRequestHeaders ? getRequestHeaders() : {};
-    headers['Content-Type'] = 'application/json';
-    const response = await fetch('/api/plugins/edge-tts/generate', {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ text, voice, rate }),
+    const synthesis = await providerRegistry.synthesize(profile, {
+        text,
+        voiceId: voice,
+        synthesisParams: { rate },
+        signal,
     });
-
-    if (!response.ok) {
-        const errorText = await response.text().catch(() => '');
-        throw new Error(`Edge TTS HTTP ${response.status} ${errorText || response.statusText || ''}`.trim());
-    }
-
-    const blob = await response.blob();
+    const blob = synthesis.blob;
+    Object.assign(getAudit().provider_ready, {
+        status: 'success', error: null, profile_id: profile.id, provider_type: profile.type, probe_ok: true,
+    });
     const record = {
         hash,
         ...baseMeta,
         blob,
         timestamp: Date.now(),
     };
-    saveCachedAudio(record).catch(error => console.warn(`[${extensionName}] cache save failed`, error));
+    await saveCachedAudio(record);
+    record.localPersisted = true;
+    pruneLocalAudioCache().catch(error => console.warn(`[${extensionName}] cache prune failed`, error));
     uploadServerCachedAudio(record).catch(error => console.warn(`[${extensionName}] shared edge cache save failed`, error));
-    return {
-        ...record,
-        blobUrl: URL.createObjectURL(blob),
-        isCached: false,
-        cacheSource: 'generated',
+    return materializeAudioRecord(record, 'generated');
+}
+
+function getDoubaoContextText(profile, segment) {
+    return [
+        String(profile.contextText || '').trim(),
+        segment.emotionLabel ? `情绪：${String(segment.emotionLabel).trim()}` : '',
+    ].filter(Boolean).join('；');
+}
+
+async function buildDoubaoAudioCacheIdentity(segment) {
+    const profile = getProviderProfile(segment.profileId, 'doubao', DOUBAO_NATIVE_PROFILE_ID);
+    if (!profile) throw new Error('没有可用的豆包 TTS Profile');
+    const text = String(segment.text || '').trim();
+    const voice = String(segment.voiceId || profile.defaultVoice || '').trim();
+    const resourceId = String(profile.resourceId || 'seed-tts-2.0').trim();
+    const contextText = getDoubaoContextText(profile, segment);
+    const cacheDescriptor = buildSynthesisDescriptor({
+        providerType: 'doubao',
+        profileId: profile.id,
+        model: resourceId,
+        text,
+        voiceId: voice,
+        responseFormat: 'mp3',
+        extraBody: { contextText },
+    });
+    const hash = await sha256(stableSerialize(cacheDescriptor));
+    const baseMeta = {
+        engine: 'doubao',
+        profileId: profile.id,
+        type: segment.type || 'dialogue',
+        text,
+        character: segment.character || '',
+        voice,
+        resourceId,
+        contextText,
+        timestamp: Date.now(),
     };
+    return { profile, text, voice, resourceId, contextText, hash, baseMeta };
+}
+
+async function ensureDoubaoAudio(segment, { signal } = {}) {
+    const { profile, text, voice, contextText, hash, baseMeta } = await buildDoubaoAudioCacheIdentity(segment);
+    const cached = await findCachedAudio(hash, baseMeta, signal);
+    if (cached?.blob) return cached;
+
+    const synthesis = await providerRegistry.synthesize(profile, {
+        text,
+        voiceId: voice,
+        contextText,
+        signal,
+    });
+    Object.assign(getAudit().provider_ready, {
+        status: 'success', error: null, profile_id: profile.id, provider_type: profile.type, probe_ok: true,
+    });
+    const record = {
+        hash,
+        ...baseMeta,
+        blob: synthesis.blob,
+        timestamp: Date.now(),
+    };
+    await saveCachedAudio(record);
+    record.localPersisted = true;
+    pruneLocalAudioCache().catch(error => console.warn(`[${extensionName}] cache prune failed`, error));
+    uploadServerCachedAudio(record).catch(error => console.warn(`[${extensionName}] shared doubao cache save failed`, error));
+    return materializeAudioRecord(record, 'generated');
+}
+
+async function ensureRoutedAudio(segment, options = {}) {
+    if (segment.routeError) throw new Error(segment.routeError);
+    const profile = getSettings().providerProfiles?.[segment.profileId];
+    if (!profile) throw new Error(`找不到 TTS Profile: ${segment.profileId || '未配置'}`);
+    if (profile.type === 'edge') return ensureEdgeAudio(segment, options);
+    if (profile.type === 'openai-compatible') return ensureIndexAudio(segment, options);
+    if (profile.type === 'doubao') return ensureDoubaoAudio(segment, options);
+    throw new Error(`不支持的 TTS Provider: ${profile.type || 'unknown'}`);
 }
 
 async function buildAudiobookQueue(msg, { dialogueOnly = false } = {}) {
@@ -1111,22 +1402,17 @@ async function buildAudiobookQueue(msg, { dialogueOnly = false } = {}) {
 
     const queue = [];
     const missingVoices = new Set();
-    const segments = analysis.segments.filter(segment => {
-        if (segment.engine === 'edge') return settings.readNarration !== false && !dialogueOnly;
-        return true;
-    });
+    const segments = analysis.segments.filter(segment => !dialogueOnly || segment.type === 'dialogue');
 
     for (let i = 0; i < segments.length; i += 1) {
         const segment = segments[i];
-        if (segment.engine === 'index' && !segment.voice) {
+        if (segment.routeError || !segment.voiceId) {
             missingVoices.add(segment.character || 'Unknown');
             continue;
         }
 
         try {
-            const record = segment.engine === 'edge'
-                ? await ensureEdgeAudio(segment)
-                : await ensureIndexAudio(segment);
+            const record = await ensureRoutedAudio(segment);
             queue.push({
                 ...record,
                 index: queue.length,
@@ -1139,7 +1425,7 @@ async function buildAudiobookQueue(msg, { dialogueOnly = false } = {}) {
             });
         } catch (error) {
             console.error(`[${extensionName}] segment generation failed`, segment, error);
-            toastError(`${segment.engine === 'edge' ? 'Edge' : 'IndexTTS2'} 片段生成失败: ${error.message}`);
+            toastError(`${segment.providerType || 'TTS'} 片段生成失败: ${error.message}`);
         }
     }
 
@@ -1152,10 +1438,10 @@ async function buildAudiobookQueue(msg, { dialogueOnly = false } = {}) {
 function analyzeMessage(msg) {
     const settings = getSettings();
     const analysis = collectSegmentsFromMessage(msg);
-    const dialogues = analysis.segments.filter(segment => segment.engine === 'index');
-    const narration = analysis.segments.filter(segment => segment.engine === 'edge');
+    const dialogues = analysis.segments.filter(segment => segment.type === 'dialogue');
+    const narration = analysis.segments.filter(segment => segment.type === 'narration');
     const characters = Array.from(new Set(dialogues.map(segment => segment.character).filter(Boolean)));
-    const missingVoices = Array.from(new Set(dialogues.filter(segment => !settings.voiceMap[segment.character]).map(segment => segment.character || 'Unknown')));
+    const missingVoices = Array.from(new Set(dialogues.filter(segment => segment.routeError || !segment.voiceId).map(segment => segment.character || 'Unknown')));
     return { ...analysis, dialogues, narration, characters, missingVoices };
 }
 
@@ -1196,6 +1482,33 @@ async function preGenerateDialogues(msg, button = null) {
 }
 
 async function playSingleDialogue(msg, dialogueIndex, button = null) {
+    const dialogueKey = getInlineDialogueButtonKey(msg, dialogueIndex);
+    const activeSession = playbackSessions.getActive();
+    if (activeSession?.inlineDialogueKey === dialogueKey || activeSession?.currentInlineDialogueKey === dialogueKey) {
+        const audio = currentPlayback.audio;
+        if (!audio || activeSession.status === 'preparing') {
+            stopCurrentPlayback();
+            return true;
+        }
+        if (!audio.paused && activeSession.status === 'playing') {
+            audio.pause();
+            activeSession.status = 'paused';
+            setInlineDialogueButtonState(dialogueKey, 'ready', { cacheReady: true });
+            emitPlaybackState(activeSession, 'paused');
+            return true;
+        }
+        try {
+            if (activeSession.status === 'completed' && Number.isFinite(audio.duration)) audio.currentTime = 0;
+            await audio.play();
+            activeSession.status = 'playing';
+            setInlineDialogueButtonState(dialogueKey, 'playing', { cacheReady: true });
+            emitPlaybackState(activeSession, 'playing');
+        } catch (error) {
+            setInlineDialogueButtonState(dialogueKey, 'error', { cacheReady: true, error });
+            toastWarn(`无法继续播放：${error.message}`);
+        }
+        return true;
+    }
     const analysis = analyzeMessage(msg);
     if (!analysis.hasContent) {
         toastInfo('未找到 <content> 正文块');
@@ -1206,69 +1519,179 @@ async function playSingleDialogue(msg, dialogueIndex, button = null) {
         toastWarn('没有找到这句已打标台词');
         return;
     }
-    if (!dialogue.voice) {
+    if (dialogue.routeError || !dialogue.voiceId) {
         toastWarn(`${dialogue.character || '该角色'} 未配置音色`);
         return;
     }
 
-    button?.classList.add('has-busy');
+    setInlineDialogueButtonState(dialogueKey, 'preparing');
     try {
-        stopCurrentPlayback();
-        toastInfo(`正在准备 ${dialogue.character} 的单句台词...`);
-        const record = await ensureIndexAudio(dialogue);
-        currentPlayback.playlist = [{
-            ...record,
-            index: 0,
-            sourceIndex: Number(dialogueIndex),
-            engine: 'index',
-            type: 'dialogue',
-            text: dialogue.text,
+        await playLightweightText(dialogue.text, {
+            source: 'dialogue',
+            profileId: dialogue.profileId,
+            voiceId: dialogue.voiceId,
             character: dialogue.character,
-            emotion: dialogue.emotion || '',
-        }];
-        currentPlayback.index = 0;
-        currentPlayback.msg = msg;
-        currentPlayback.sessionId = Date.now();
-
-        setLinkedQueue({
-            segments: [{
-                text: dialogue.text,
-                character: dialogue.character,
-                engine: 'index',
-                cacheSource: record.cacheSource || '',
-                index: 0,
-            }],
-            index: 0,
-            controller: {
-                play: () => currentPlayback.audio?.play?.(),
-                pause: () => currentPlayback.audio?.pause?.(),
-                next: stopCurrentPlayback,
-                previous: () => {},
-                goTo: () => {},
-                stop: stopCurrentPlayback,
-            },
-            mode: 'audiobook',
+            segment: dialogue,
+            inlineDialogueKey: dialogueKey,
         });
-        openStageFromCurrentChat({ mode: 'audiobook', forceInline: true, noAutoAdvance: true, keepLinked: true });
+    } catch (error) {
+        setInlineDialogueButtonState(dialogueKey, 'error', { error });
+        throw error;
+    }
+}
 
+async function playLightweightText(text, {
+    source = 'selection',
+    profileId = '',
+    voiceId = '',
+    character = '',
+    segment: suppliedSegment = null,
+    sourceMessage = null,
+    inlineDialogueKey = '',
+} = {}) {
+    const audit = beginAuditRun(`speak:${source}`);
+    if (inlineDialogueKey) setInlineDialogueButtonState(inlineDialogueKey, 'preparing');
+    const cleanText = normalizeWhitespace(String(text || '')).slice(0, 10000);
+    if (!cleanText) {
+        Object.assign(audit.audio_played, {
+            status: 'fail', error: 'empty_text', source, first_segment_started: false, order_ok: false,
+        });
+        audit.last_error = 'empty_text';
+        toastWarn('没有可朗读的文字');
+        return false;
+    }
+    const settings = getSettings();
+    const preset = getActivePreset(settings);
+    let matchedSegment = suppliedSegment;
+    if (!matchedSegment && sourceMessage) {
+        const normalizedTarget = normalizeWhitespace(cleanText);
+        matchedSegment = collectSegmentsFromMessage(sourceMessage).segments
+            .find(item => normalizeWhitespace(item.text) === normalizedTarget) || null;
+    }
+    const baseSegment = matchedSegment
+        ? { ...matchedSegment, text: cleanText }
+        : { type: 'single', character, text: cleanText };
+    const effectiveProfileId = String(profileId || baseSegment.profileId || '').trim();
+    const selectedProfile = settings.providerProfiles?.[effectiveProfileId];
+    const explicitVoiceId = String(voiceId || baseSegment.voiceId || selectedProfile?.defaultVoice || selectedProfile?.edgeVoice || '').trim();
+    const route = effectiveProfileId
+        ? {
+            ok: !!selectedProfile && !!explicitVoiceId,
+            profileId: effectiveProfileId,
+            voiceId: explicitVoiceId,
+            providerType: selectedProfile?.type,
+            error: !selectedProfile ? '找不到指定 TTS Profile' : (!explicitVoiceId ? '没有指定音色' : null),
+        }
+        : resolveSegmentRoute(baseSegment, preset, settings.providerProfiles);
+    const segment = {
+        ...baseSegment,
+        profileId: route.profileId,
+        voiceId: route.voiceId,
+        providerType: route.providerType,
+        routeError: route.error,
+    };
+    if (!route.ok) {
+        Object.assign(audit.route_built, {
+            status: 'fail', error: route.error || 'route_unresolved', mode: 'single', narration_count: 0, dialogue_count: 0,
+        });
+        audit.last_error = route.error || 'route_unresolved';
+        toastError(route.error || '无法确定 TTS 路由');
+        return false;
+    }
+
+    stopCurrentPlayback();
+    const session = playbackSessions.start({ source, segments: [segment] });
+    session.inlineDialogueKey = inlineDialogueKey;
+    session.inlineAudioReady = false;
+    currentPlayback.session = session;
+    currentPlayback.sessionId = session.id;
+    const requestController = playbackSessions.createController(session, 0);
+    emitPlaybackState(session, 'preparing');
+    try {
+        const record = await ensureRoutedAudio(segment, { signal: requestController.signal });
+        playbackSessions.finishController(session, 0);
+        if (!playbackSessions.isActive(session) || !playbackSessions.registerObjectUrl(session, record.blobUrl)) return false;
+        session.inlineAudioReady = true;
+        if (inlineDialogueKey) setInlineDialogueButtonState(inlineDialogueKey, 'ready', { cacheReady: true });
+        Object.assign(audit.cache, {
+            status: 'success', error: null, cache_source: record.cacheSource || 'generated', api_key_in_descriptor: false,
+            persistent_ready: record.cacheSource !== 'generated' || record.localPersisted === true,
+            lookup_order: 'memory-indexeddb-server-provider',
+        });
+        session.segments[0].synthesisStatus = 'success';
+        emitSegmentChanged(session, 0);
+        const item = { ...segment, ...record, index: 0 };
+        currentPlayback.playlist = [item];
+        currentPlayback.index = 0;
         const audio = new Audio(record.blobUrl);
         currentPlayback.audio = audio;
-        audio.volume = Math.max(0, Math.min(1, Number(getSettings().volume || 1)));
-        audio.playbackRate = Math.max(0.5, Math.min(2, Number(getSettings().speed || 1)));
-        audio.addEventListener('loadedmetadata', () => setStageProgress(audio.currentTime, audio.duration));
-        audio.addEventListener('timeupdate', () => setStageProgress(audio.currentTime, audio.duration));
-        audio.addEventListener('play', () => setLinkedPlaybackState(true));
-        audio.addEventListener('pause', () => setLinkedPlaybackState(false));
-        audio.addEventListener('ended', () => {
-            setStageProgress(audio.duration || 0, audio.duration || 0);
+        const controller = {
+            play: () => audio.play?.(),
+            pause: () => audio.pause?.(),
+            next: () => {},
+            previous: () => {},
+            goTo: () => {},
+            seek: percent => {
+                if (Number.isFinite(audio.duration) && audio.duration > 0) audio.currentTime = audio.duration * clamp(Number(percent) || 0, 0, 1);
+            },
+            stop: stopCurrentPlayback,
+        };
+        currentPlayback.controller = controller;
+        stageState.uiMode = 'player';
+        setLinkedQueue({
+            segments: [item], index: 0, controller, mode: 'audiobook', openStage: false,
+        });
+        document.getElementById('has-stage')?.classList.remove('has-open');
+        openAudioPlayer();
+        audio.volume = Math.max(0, Math.min(1, Number(settings.volume || 1)));
+        audio.playbackRate = Math.max(0.5, Math.min(3, Number(settings.playbackRate || 1)));
+        audio.addEventListener('play', () => {
+            if (!playbackSessions.isActive(session)) return;
+            session.status = 'playing';
+            if (inlineDialogueKey) setInlineDialogueButtonState(inlineDialogueKey, 'playing', { cacheReady: true });
+            setLinkedPlaybackState(true);
+            emitPlaybackState(session, 'playing');
+        });
+        audio.addEventListener('pause', () => {
+            if (!playbackSessions.isActive(session)) return;
             setLinkedPlaybackState(false);
+            if (inlineDialogueKey && session.status !== 'completed') {
+                setInlineDialogueButtonState(inlineDialogueKey, 'ready', { cacheReady: session.inlineAudioReady });
+            }
+        });
+        audio.addEventListener('timeupdate', () => {
+            if (playbackSessions.isActive(session)) setStageProgress(audio.currentTime, audio.duration);
+        });
+        audio.addEventListener('ended', () => {
+            if (!playbackSessions.isActive(session)) return;
+            session.status = 'completed';
+            if (inlineDialogueKey) setInlineDialogueButtonState(inlineDialogueKey, 'ready', { cacheReady: true });
+            setLinkedPlaybackState(false);
+            emitPlaybackState(session, 'completed');
         }, { once: true });
+        Object.assign(audit.selection_captured ||= {}, {
+            status: 'success', error: null, character_count: cleanText.length, message_id: latestTextSelection.messageId || null,
+        });
         await audio.play();
+        Object.assign(audit.audio_played, {
+            status: 'success', error: null, source, first_segment_started: true, order_ok: true,
+        });
+        return true;
     } catch (error) {
-        console.error(`[${extensionName}] single dialogue play failed`, error);
-        toastError(`单句播放失败: ${error.message}`);
-    } finally {
-        button?.classList.remove('has-busy');
+        playbackSessions.finishController(session, 0);
+        if (error?.name === 'AbortError' || session.status === 'cancelled') return false;
+        if (inlineDialogueKey) setInlineDialogueButtonState(inlineDialogueKey, 'error', { error });
+        session.segments[0].synthesisStatus = 'error';
+        Object.assign(audit.audio_played, {
+            status: 'fail', error: error?.message || String(error), source, first_segment_started: false, order_ok: false,
+        });
+        audit.last_error = error?.message || String(error);
+        emitPlaybackState(session, 'error', error.message);
+        const routeHint = segment.profileId === LEGACY_OPENAI_PROFILE_ID
+            ? '；这句仍有旧的 IndexTTS2 特定角色覆盖，请在轻量 TTS 第 1 步清除旧 Index 覆盖'
+            : '';
+        toastError(`朗读失败：${error.message}${routeHint}`);
+        return false;
     }
 }
 
@@ -1282,6 +1705,7 @@ function loadAudioDuration(blobUrl) {
 }
 
 function stopCurrentPlayback() {
+    const stoppedSession = currentPlayback.session || playbackSessions.getActive();
     if (currentPlayback.audio) {
         try {
             currentPlayback.audio.pause();
@@ -1291,6 +1715,18 @@ function stopCurrentPlayback() {
         }
     }
     currentPlayback.audio = null;
+    playbackSessions.cancel('stopped');
+    if (stoppedSession?.inlineDialogueKey) {
+        setInlineDialogueButtonState(
+            stoppedSession.inlineDialogueKey,
+            stoppedSession.inlineAudioReady ? 'ready' : 'idle',
+            { cacheReady: stoppedSession.inlineAudioReady },
+        );
+    }
+    if (stoppedSession?.currentInlineDialogueKey) {
+        setInlineDialogueButtonState(stoppedSession.currentInlineDialogueKey, 'ready', { cacheReady: true });
+    }
+    currentPlayback.session = null;
     currentPlayback.controller = null;
     currentPlayback.playlist = [];
     currentPlayback.index = 0;
@@ -1305,68 +1741,181 @@ function stopCurrentPlayback() {
     renderAudioPlayer();
 }
 
-async function playAudiobookMessage(msg, button = null) {
+async function playAudiobookMessage(msg, button = null, { playbackUiOverride = null } = {}) {
+    const audit = beginAuditRun('speak:message');
     if (getSettings().ttsEnabled === false) {
+        audit.last_error = 'tts_disabled';
         toastWarn('请先启用有声书 TTS');
         return;
     }
 
     button?.classList.add('has-busy');
+    let session = null;
     try {
-        toastInfo('正在准备有声书播放队列...');
-        const queue = await buildAudiobookQueue(msg);
-        if (!queue.length) {
+        const analysis = collectSegmentsFromMessage(msg);
+        if (!analysis.hasContent || !analysis.segments.length) {
             toastWarn('没有可播放的有声书片段');
             return;
         }
 
         stopCurrentPlayback();
-        const playlist = [];
-        let totalDuration = 0;
-        for (const item of queue) {
-            const duration = await loadAudioDuration(item.blobUrl);
-            playlist.push({
-                ...item,
-                index: playlist.length,
-                duration,
-                startOffset: totalDuration,
-            });
-            totalDuration += duration;
-        }
-
-        currentPlayback.playlist = playlist;
+        session = playbackSessions.start({ source: 'message', segments: analysis.segments });
+        session.messageId = getMessageId(msg);
+        session.currentInlineDialogueKey = '';
+        currentPlayback.session = session;
+        currentPlayback.sessionId = session.id;
+        emitPlaybackState(session, 'preparing');
         currentPlayback.msg = msg;
-        const sessionId = Date.now();
-        currentPlayback.sessionId = sessionId;
+        currentPlayback.playlist = new Array(session.segments.length);
+        const playlist = currentPlayback.playlist;
+        const pending = new Map();
         const audio = new Audio();
         currentPlayback.audio = audio;
-        toastInfo(`有声书队列已准备：${playlist.length} 段`);
+
+        const isCurrent = () => playbackSessions.isActive(session) && currentPlayback.session === session;
+        const prepareSegment = index => {
+            if (!isCurrent() || index < 0 || index >= session.segments.length) return Promise.resolve(null);
+            if (playlist[index]) return Promise.resolve(playlist[index]);
+            if (pending.has(index)) return pending.get(index);
+            const segment = session.segments[index];
+            segment.synthesisStatus = 'pending';
+            const requestController = playbackSessions.createController(session, index);
+            const promise = ensureRoutedAudio(segment, { signal: requestController.signal })
+                .then(record => {
+                    if (!isCurrent() || !playbackSessions.registerObjectUrl(session, record.blobUrl)) {
+                        throw new DOMException('Stale playback session', 'AbortError');
+                    }
+                    segment.synthesisStatus = 'success';
+                    const item = { ...segment, ...record, index, sourceIndex: index };
+                    playlist[index] = item;
+                    if (segment.type === 'dialogue' && Number.isInteger(segment.dialogueIndex)) {
+                        setInlineDialogueButtonState(
+                            getInlineDialogueButtonKey(msg, segment.dialogueIndex),
+                            'ready',
+                            { cacheReady: true },
+                        );
+                    }
+                    Object.assign(getAudit().cache, {
+                        status: 'success', error: null, cache_source: record.cacheSource || 'generated', api_key_in_descriptor: false,
+                        persistent_ready: record.cacheSource !== 'generated' || record.localPersisted === true,
+                        lookup_order: 'memory-indexeddb-server-provider',
+                    });
+                    return item;
+                })
+                .catch(error => {
+                    segment.synthesisStatus = error?.name === 'AbortError' || !isCurrent() ? 'cancelled' : 'error';
+                    segment.synthesisError = error?.name === 'AbortError' ? null : (error?.message || String(error));
+                    if (error?.name === 'AbortError') return null;
+                    console.warn(`[${extensionName}] segment generation failed`, { index, error });
+                    if (segment.profileId === LEGACY_OPENAI_PROFILE_ID && !session.legacyOverrideWarningShown) {
+                        session.legacyOverrideWarningShown = true;
+                        toastWarn('有角色仍使用旧的 IndexTTS2 特定覆盖；请在轻量 TTS 第 1 步点击“清除旧 Index 覆盖”');
+                    }
+                    return null;
+                })
+                .finally(() => {
+                    playbackSessions.finishController(session, index);
+                    pending.delete(index);
+                });
+            pending.set(index, promise);
+            return promise;
+        };
+
+        const prefetch = index => {
+            const count = Math.max(0, Math.min(2, Number(getSettings().prefetchCount) || 2));
+            Object.assign(getAudit().prefetch, { status: 'success', error: null, max_ahead: count });
+            for (let offset = 1; offset <= count; offset += 1) prepareSegment(index + offset);
+        };
+
+        const playTrack = async (requestedIndex, seekTime = 0) => {
+            if (!isCurrent()) return false;
+            let index = Math.max(0, Number(requestedIndex) || 0);
+            let item = null;
+            while (index < session.segments.length && !item && isCurrent()) {
+                item = await prepareSegment(index);
+                if (!item) index += 1;
+            }
+            if (!isCurrent()) return false;
+            if (!item) {
+                const hadPlayableSegment = playlist.some(Boolean);
+                session.status = hadPlayableSegment ? 'completed' : 'error';
+                if (!hadPlayableSegment) {
+                    Object.assign(audit.audio_played, {
+                        status: 'fail', error: 'all_segments_failed', source: 'message', first_segment_started: false, order_ok: false,
+                    });
+                    audit.last_error = 'all_segments_failed';
+                }
+                emitPlaybackState(session, session.status, hadPlayableSegment ? null : 'all_segments_failed');
+                setLinkedPlaybackState(false);
+                if (!hadPlayableSegment) toastError('所有 TTS 片段均生成失败');
+                renderAudioPlayer();
+                return false;
+            }
+
+            currentPlayback.index = index;
+            session.currentIndex = index;
+            if (session.currentInlineDialogueKey) {
+                setInlineDialogueButtonState(session.currentInlineDialogueKey, 'ready', { cacheReady: true });
+            }
+            session.currentInlineDialogueKey = item.type === 'dialogue' && Number.isInteger(item.dialogueIndex)
+                ? getInlineDialogueButtonKey(msg, item.dialogueIndex)
+                : '';
+            emitSegmentChanged(session, index);
+            showLinkedSegment(index);
+            setStageProgress(0, item.duration || 0);
+            audio.volume = Math.max(0, Math.min(1, Number(getSettings().volume || 1)));
+            audio.playbackRate = Math.max(0.5, Math.min(2, Number(getSettings().playbackRate || 1)));
+            if (audio.src !== item.blobUrl) {
+                audio.src = item.blobUrl;
+                audio.load();
+            }
+            if (seekTime > 0 && audio.readyState >= 1) audio.currentTime = seekTime;
+            try {
+                await audio.play();
+                if (!isCurrent()) return false;
+                session.status = 'playing';
+                if (session.currentInlineDialogueKey) {
+                    setInlineDialogueButtonState(session.currentInlineDialogueKey, 'playing', { cacheReady: true });
+                }
+                emitPlaybackState(session, 'playing');
+                Object.assign(audit.audio_played, {
+                    status: 'success', error: null, source: 'message', first_segment_started: true, order_ok: true,
+                });
+                prefetch(index);
+                return true;
+            } catch (error) {
+                if (!isCurrent()) return false;
+                Object.assign(audit.audio_played, {
+                    status: 'fail', error: error?.message || String(error), source: 'message', first_segment_started: false, order_ok: false,
+                });
+                audit.last_error = error?.message || String(error);
+                console.warn(`[${extensionName}] playlist play blocked`, error);
+                setLinkedPlaybackState(false);
+                toastWarn('浏览器阻止了连续播放，请点击播放键继续');
+                return false;
+            }
+        };
 
         const controller = {
             play: () => audio.play?.(),
-            pause: () => currentPlayback.audio?.pause?.(),
-            next: () => playTrack(Math.min(playlist.length - 1, currentPlayback.index + 1), 0),
+            pause: () => audio.pause?.(),
+            next: () => playTrack(currentPlayback.index + 1, 0),
             previous: () => playTrack(Math.max(0, currentPlayback.index - 1), 0),
-            goTo: index => playTrack(Math.max(0, Math.min(playlist.length - 1, Number(index) || 0)), 0),
+            goTo: index => playTrack(Math.max(0, Math.min(session.segments.length - 1, Number(index) || 0)), 0),
             seek: percent => {
                 const safePercent = clamp(Number(percent) || 0, 0, 1);
-                if (Number.isFinite(audio.duration) && audio.duration > 0) {
-                    audio.currentTime = audio.duration * safePercent;
-                }
+                if (Number.isFinite(audio.duration) && audio.duration > 0) audio.currentTime = audio.duration * safePercent;
             },
             stop: stopCurrentPlayback,
         };
         currentPlayback.controller = controller;
-        const playbackUi = getSettings().audiobookPlaybackUi === 'player' ? 'player' : 'video';
+        const playbackUi = playbackUiOverride === 'video' || playbackUiOverride === 'player'
+            ? playbackUiOverride
+            : (getSettings().audiobookPlaybackUi === 'video' ? 'video' : 'player');
         stageState.uiMode = playbackUi;
-
         setLinkedQueue({
-            segments: playlist.map(item => ({
-                text: item.text,
-                character: item.character,
-                engine: item.engine,
-                cacheSource: item.cacheSource || '',
-                index: item.index,
+            segments: session.segments.map((item, index) => ({
+                text: item.text, character: item.character, engine: item.providerType || item.engine, cacheSource: '', index,
             })),
             index: 0,
             controller,
@@ -1381,63 +1930,55 @@ async function playAudiobookMessage(msg, button = null) {
             openAudioPlayer();
         }
 
-        audio.addEventListener('play', () => setLinkedPlaybackState(true));
-        audio.addEventListener('pause', () => setLinkedPlaybackState(false));
-        audio.addEventListener('loadedmetadata', () => setStageProgress(audio.currentTime, audio.duration));
-        audio.addEventListener('timeupdate', () => setStageProgress(audio.currentTime, audio.duration));
+        audio.addEventListener('play', () => {
+            if (!isCurrent()) return;
+            session.status = 'playing';
+            if (session.currentInlineDialogueKey) {
+                setInlineDialogueButtonState(session.currentInlineDialogueKey, 'playing', { cacheReady: true });
+            }
+            setLinkedPlaybackState(true);
+            emitPlaybackState(session, 'playing');
+        });
+        audio.addEventListener('pause', () => {
+            if (!isCurrent()) return;
+            if (session.status === 'playing') session.status = 'paused';
+            if (session.currentInlineDialogueKey) {
+                setInlineDialogueButtonState(session.currentInlineDialogueKey, 'ready', { cacheReady: true });
+            }
+            setLinkedPlaybackState(false);
+        });
+        audio.addEventListener('loadedmetadata', () => {
+            if (isCurrent()) setStageProgress(audio.currentTime, audio.duration);
+        });
+        audio.addEventListener('timeupdate', () => {
+            if (isCurrent()) setStageProgress(audio.currentTime, audio.duration);
+        });
         audio.addEventListener('ended', () => {
+            if (!isCurrent()) return;
             setStageProgress(audio.duration || 0, audio.duration || 0);
             setLinkedPlaybackState(false);
+            if (currentPlayback.index >= session.segments.length - 1) {
+                session.status = 'completed';
+                emitPlaybackState(session, 'completed');
+                renderAudioPlayer();
+                return;
+            }
             playTrack(currentPlayback.index + 1, 0);
         });
         audio.addEventListener('error', () => {
-            console.warn(`[${extensionName}] track audio error`, {
-                index: currentPlayback.index,
-                item: playlist[currentPlayback.index],
-            });
+            if (!isCurrent()) return;
             setLinkedPlaybackState(false);
             playTrack(currentPlayback.index + 1, 0);
         });
 
-        function playTrack(index, seekTime = 0) {
-            if (currentPlayback.sessionId !== sessionId) return;
-            if (index >= playlist.length) {
-                stopCurrentPlayback();
-                return;
-            }
-
-            const item = playlist[index];
-            currentPlayback.index = index;
-            showLinkedSegment(index);
-            setStageProgress(0, item.duration || 0);
-            audio.volume = Math.max(0, Math.min(1, Number(getSettings().volume || 1)));
-            audio.playbackRate = Math.max(0.5, Math.min(2, Number(getSettings().speed || 1)));
-            if (audio.src !== item.blobUrl) {
-                audio.src = item.blobUrl;
-                audio.load();
-            }
-            const startPlayback = () => {
-                if (currentPlayback.sessionId !== sessionId || currentPlayback.index !== index) return;
-                if (seekTime > 0) {
-                    try {
-                        audio.currentTime = seekTime;
-                    } catch (error) {
-                        console.warn(`[${extensionName}] seek failed`, error);
-                    }
-                }
-                audio.play().catch(error => {
-                    console.warn(`[${extensionName}] playlist play blocked`, error);
-                    setLinkedPlaybackState(false);
-                    toastWarn('浏览器阻止了连续播放，请点字幕面板播放键继续');
-                });
-            };
-            if (audio.readyState >= 1) startPlayback();
-            else audio.addEventListener('loadedmetadata', startPlayback, { once: true });
-            setTimeout(startPlayback, 250);
-        }
-
-        playTrack(0, 0);
+        toastInfo(`正在准备第 1 段，共 ${session.segments.length} 段`);
+        await playTrack(0, 0);
     } catch (error) {
+        if (error?.name === 'AbortError' || session?.status === 'cancelled') return;
+        Object.assign(audit.audio_played, {
+            status: 'fail', error: error?.message || String(error), source: 'message', first_segment_started: false, order_ok: false,
+        });
+        audit.last_error = error?.message || String(error);
         console.error(`[${extensionName}] play failed`, error);
         toastError(`有声书播放失败: ${error.message}`);
     } finally {
@@ -1454,79 +1995,141 @@ function ensureSettingsPanel() {
     container.innerHTML = `
         <div class="inline-drawer">
             <div class="inline-drawer-toggle inline-drawer-header">
-                <b>🎧 混合有声书舞台</b>
+                <b><i class="fa-solid fa-headphones" aria-hidden="true"></i> 轻量 TTS</b>
                 <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
             </div>
             <div class="inline-drawer-content">
-                <div class="has-section-title">有声书 TTS</div>
-                <label class="checkbox_label"><input id="has-tts-enabled" type="checkbox"><span>启用有声书 TTS</span></label>
-                <label class="checkbox_label"><input id="has-read-narration" type="checkbox"><span>用 Edge 朗读旁白</span></label>
-                <label class="checkbox_label"><input id="has-shared-cache" type="checkbox"><span>启用服务器共享音频缓存</span></label>
-                <label class="checkbox_label"><input id="has-index-proxy" type="checkbox"><span>通过酒馆服务器代理 IndexTTS2（手机推荐）</span></label>
-                <label class="has-field">
-                    <span>有声书播放界面</span>
-                    <select id="has-playback-ui" class="text_pole">
-                        <option value="player">纯播放器</option>
-                        <option value="video">视频舞台</option>
-                    </select>
-                </label>
-                <label class="has-field"><span>IndexTTS2 接口地址</span><input id="has-tts-url" class="text_pole" type="text"></label>
-                <label class="has-field"><span>IndexTTS2 启动脚本</span><input id="has-index-start-bat" class="text_pole" type="text"></label>
-                <div class="has-service-actions">
-                    <button id="has-check-index" class="menu_button" type="button">检测 IndexTTS2</button>
-                    <button id="has-start-index" class="menu_button" type="button">启动 API</button>
+                <div class="has-quick-intro">
+                    <strong>三步开始朗读</strong>
+                    <span>选模式和声音 → 测试连接与试听 → 回到聊天点击朗读按钮</span>
                 </div>
-                <div id="has-index-status" class="has-service-status has-muted">还未检测 IndexTTS2。</div>
-                <label class="has-field"><span>IndexTTS2 模型名</span><input id="has-tts-model" class="text_pole" type="text"></label>
-                <label class="has-field"><span>默认音色</span><input id="has-default-voice" class="text_pole" type="text" placeholder="default.wav"></label>
-                <label class="has-field"><span>Edge 旁白音色</span><input id="has-edge-voice" class="text_pole" type="text" placeholder="zh-CN-XiaoxiaoNeural"></label>
-                <div class="has-service-actions">
-                    <button id="has-check-edge" class="menu_button" type="button">检测 Edge</button>
-                    <button id="has-test-edge" class="menu_button" type="button">测试 Edge 朗读</button>
-                </div>
-                <div id="has-edge-status" class="has-service-status has-muted">还未检测 Edge TTS。</div>
-                <label class="has-field"><span>共享缓存上限 MB</span><input id="has-shared-cache-max" class="text_pole" type="number" min="64" max="102400" step="64"></label>
-                <div class="has-service-actions">
-                    <button id="has-cache-stats" class="menu_button" type="button">缓存统计</button>
-                    <button id="has-multidevice-check" class="menu_button" type="button">多端自检</button>
-                    <button id="has-prune-shared-cache" class="menu_button" type="button">按上限清理</button>
-                    <button id="has-clear-shared-cache" class="menu_button" type="button">清理共享缓存</button>
-                </div>
-                <div class="has-service-actions">
-                    <button id="has-clear-local-cache" class="menu_button" type="button">清理本机缓存</button>
-                    <button id="has-cache-help" class="menu_button" type="button">缓存说明</button>
-                </div>
-                <div id="has-cache-status" class="has-service-status has-muted">共享缓存用于 PC/手机复用同一台酒馆服务器上的音频。</div>
-                <label class="has-field"><span>语速 <span id="has-speed-value"></span></span><input id="has-speed" type="range" min="0.5" max="2" step="0.1"></label>
-                <label class="has-field"><span>音量 <span id="has-volume-value"></span></span><input id="has-volume" type="range" min="0" max="1" step="0.05"></label>
-                <div class="has-section-title">角色音色</div>
-                <div id="has-voice-map"></div>
-                <div class="has-voice-add">
-                    <input id="has-add-character" class="text_pole" type="text" placeholder="角色名">
-                    <input id="has-add-voice" class="text_pole" type="text" placeholder="voice.wav">
-                    <button id="has-add-voice-row" class="menu_button" type="button">添加</button>
-                </div>
+                <section class="has-settings-card" data-testid="has-lightweight-step-mode">
+                    <div class="has-step-heading"><span>1</span><div><strong>选择朗读方式</strong><small>日常只需要改这里。</small></div></div>
+                    <label class="checkbox_label has-primary-toggle"><input id="has-tts-enabled" type="checkbox"><span>启用轻量 TTS</span></label>
+                    <label class="has-field"><span>我的朗读方案</span><select id="has-preset-select" class="text_pole"></select></label>
+                    <label class="has-field">
+                        <span>朗读内容</span>
+                        <select id="has-preset-mode" class="text_pole">
+                            <option value="mixed">旁白和角色分别朗读</option>
+                            <option value="dialogue-only">只读角色台词</option>
+                            <option value="single-voice">全文使用一个声音</option>
+                        </select>
+                    </label>
+                    <div class="has-route-grid">
+                        <label class="has-field has-route-choice" data-route-modes="mixed"><span>旁白使用</span><select id="has-route-narration-profile" class="text_pole"></select></label>
+                        <label class="has-field has-route-choice" data-route-modes="mixed"><span>旁白音色</span><div id="has-route-narration-voice" class="has-voice-combobox"><button class="has-voice-combobox-toggle text_pole" type="button" aria-haspopup="listbox" aria-expanded="false"><span>选择音色</span><i class="fa-solid fa-chevron-down" aria-hidden="true"></i></button><div class="has-voice-combobox-popover" hidden><input class="has-voice-search text_pole" type="search" autocomplete="off" placeholder="搜索名称、ID、Locale、Gender" aria-label="搜索旁白音色"><div class="has-voice-options" role="listbox"></div></div></div></label>
+                        <label class="has-field has-route-choice" data-route-modes="mixed dialogue-only"><span>角色默认使用</span><select id="has-route-dialogue-profile" class="text_pole"></select></label>
+                        <label class="has-field has-route-choice" data-route-modes="mixed dialogue-only"><span>角色默认音色</span><div id="has-route-dialogue-voice" class="has-voice-combobox"><button class="has-voice-combobox-toggle text_pole" type="button" aria-haspopup="listbox" aria-expanded="false"><span>选择音色</span><i class="fa-solid fa-chevron-down" aria-hidden="true"></i></button><div class="has-voice-combobox-popover" hidden><input class="has-voice-search text_pole" type="search" autocomplete="off" placeholder="搜索名称、ID、Locale、Gender" aria-label="搜索角色默认音色"><div class="has-voice-options" role="listbox"></div></div></div></label>
+                        <label class="has-field has-route-choice" data-route-modes="single-voice"><span>全文使用</span><select id="has-route-single-profile" class="text_pole"></select></label>
+                        <label class="has-field has-route-choice" data-route-modes="single-voice"><span>全文音色</span><div id="has-route-single-voice" class="has-voice-combobox"><button class="has-voice-combobox-toggle text_pole" type="button" aria-haspopup="listbox" aria-expanded="false"><span>选择音色</span><i class="fa-solid fa-chevron-down" aria-hidden="true"></i></button><div class="has-voice-combobox-popover" hidden><input class="has-voice-search text_pole" type="search" autocomplete="off" placeholder="搜索名称、ID、Locale、Gender" aria-label="搜索全文音色"><div class="has-voice-options" role="listbox"></div></div></div></label>
+                    </div>
+                    <small id="has-route-help">旁白和角色可以使用不同服务与音色。</small>
+                    <div id="has-route-override-warning" class="has-route-warning" role="status" aria-live="polite" hidden>
+                        <i class="fa-solid fa-triangle-exclamation" aria-hidden="true"></i>
+                        <span id="has-route-override-warning-text"></span>
+                        <button id="has-clear-legacy-index-overrides" class="menu_button" type="button">清除旧 Index 覆盖</button>
+                    </div>
+                </section>
 
-                <div class="has-section-title">视频字幕舞台</div>
-                <label class="checkbox_label"><input id="has-enabled" type="checkbox"><span>启用字幕舞台</span></label>
-                <label class="checkbox_label"><input id="has-auto" type="checkbox"><span>字幕自动播放</span></label>
-                <label class="checkbox_label"><input id="has-window" type="checkbox"><span>视频舞台使用独立窗口</span></label>
-                <label class="has-field"><span>视频地址</span><input id="has-video-url" class="text_pole" type="text" placeholder="/scripts/extensions/third-party/HybridAudiobookStage/assets/scene.mp4"></label>
-                <label class="has-field">
-                    <span>视频适配</span>
-                    <select id="has-video-fit" class="text_pole">
-                        <option value="contain">完整显示</option>
-                        <option value="cover">铺满裁切</option>
-                        <option value="fill">拉伸填满</option>
-                    </select>
-                </label>
-                <label class="has-field"><span>每句字幕秒数</span><input id="has-seconds" class="text_pole" type="number" min="1" max="30" step="0.5"></label>
-                <div class="has-open-actions">
-                    <button id="has-open-audiobook" class="menu_button" type="button">听书面板</button>
-                    <button id="has-open-stage" class="menu_button" type="button">视频舞台</button>
-                    <button id="has-open-window" class="menu_button" type="button">独立窗口</button>
-                </div>
-                <small>纯有声书只读取第一段 &lt;content&gt; 正文；旁白走 Edge，已打标人物台词走 IndexTTS2。</small>
+                <section class="has-settings-card" data-testid="has-lightweight-step-test">
+                    <div class="has-step-heading"><span>2</span><div><strong>连接并试听声音</strong><small>如果使用本机 IndexTTS2，请先启动它的 API 后台。</small></div></div>
+                    <label class="has-field"><span>要测试的声音服务</span><select id="has-profile-select" class="text_pole"></select></label>
+                    <div id="has-doubao-quick" class="has-provider-quick" data-testid="has-doubao-quick" hidden>
+                        <div class="has-provider-quick-title"><strong>豆包原生连接</strong><small>密钥保存在 SillyTavern 共享设置中，未经额外加密。</small></div>
+                        <label class="has-field"><span>APP ID</span><input id="has-doubao-app-id" class="text_pole" type="text" autocomplete="off" placeholder="火山引擎语音应用 APP ID"></label>
+                        <label class="has-field"><span>Access Key</span><input id="has-doubao-access-key" class="text_pole" type="password" autocomplete="off" placeholder="X-Api-Access-Key"></label>
+                        <label class="has-field"><span>资源类型</span><select id="has-doubao-resource-id" class="text_pole"><option value="seed-tts-2.0">Seed TTS 2.0 合成音色</option><option value="seed-icl-2.0">Seed ICL 2.0 复刻音色</option></select></label>
+                        <label class="has-field"><span>Speaker ID</span><input id="has-doubao-speaker-id" class="text_pole" type="text" placeholder="例如 zh_female_xxx_bigtts"></label>
+                        <label class="has-field"><span>语气提示（可选）</span><input id="has-doubao-context-text" class="text_pole" type="text" maxlength="2000" placeholder="例如：温柔、自然地讲述"></label>
+                    </div>
+                    <button id="has-profile-test" class="menu_button has-primary-action" type="button"><i class="fa-solid fa-plug" aria-hidden="true"></i> 测试连接</button>
+                    <div id="has-provider-status" class="has-service-status has-muted" role="status" aria-live="polite">尚未测试连接。</div>
+                    <label class="has-field"><span>试听文字</span><input id="has-profile-preview-text" class="text_pole" type="text" value="你好，很高兴见到你。"></label>
+                    <div class="has-service-actions">
+                        <button id="has-profile-preview" class="menu_button" type="button"><i class="fa-solid fa-play" aria-hidden="true"></i> 试听声音</button>
+                        <button id="has-profile-preview-stop" class="menu_button" type="button"><i class="fa-solid fa-stop" aria-hidden="true"></i> 停止试听</button>
+                    </div>
+                </section>
+
+                <section class="has-settings-card" data-testid="has-lightweight-step-playback">
+                    <div class="has-step-heading"><span>3</span><div><strong>调整播放手感</strong><small>这些设置不会改变声音分配。</small></div></div>
+                    <label class="has-field"><span>合成语速 <span id="has-synthesis-speed-value"></span></span><input id="has-synthesis-speed" type="range" min="0.5" max="2" step="0.1"></label>
+                    <label class="has-field"><span>播放倍速 <span id="has-speed-value"></span></span><input id="has-speed" type="range" min="0.5" max="3" step="0.1"></label>
+                    <label class="has-field"><span>音量 <span id="has-volume-value"></span></span><input id="has-volume" type="range" min="0" max="1" step="0.05"></label>
+                    <label class="checkbox_label"><input id="has-shared-cache" type="checkbox"><span>PC 和手机共用已生成声音</span></label>
+                    <div class="has-daily-hint"><i class="fa-solid fa-circle-info" aria-hidden="true"></i><span>回到聊天后，可使用消息右上角按钮朗读整条、选中文字或当前段落；角色台词旁的小耳机只读该句。</span></div>
+                </section>
+
+                <details class="has-settings-fold" data-testid="has-advanced-settings">
+                    <summary><i class="fa-solid fa-sliders" aria-hidden="true"></i><span><strong>高级 TTS 设置</strong><small>新建服务、精细路由、缓存和兼容选项</small></span></summary>
+                    <div class="has-fold-content">
+                        <div class="has-section-title">朗读方案管理</div>
+                        <div class="has-service-actions">
+                            <button id="has-preset-new" class="menu_button" type="button">新建方案</button>
+                            <button id="has-preset-copy" class="menu_button" type="button">复制方案</button>
+                            <button id="has-preset-rename" class="menu_button" type="button">重命名</button>
+                            <button id="has-preset-delete" class="menu_button" type="button">删除方案</button>
+                        </div>
+
+                        <div class="has-section-title">声音服务详细配置</div>
+                        <div class="has-service-actions">
+                            <button id="has-profile-new" class="menu_button" type="button">新建服务</button>
+                            <button id="has-profile-copy" class="menu_button" type="button">复制服务</button>
+                            <button id="has-profile-delete" class="menu_button" type="button">删除服务</button>
+                        </div>
+                        <label class="has-field"><span>服务名称</span><input id="has-profile-name" class="text_pole" type="text"></label>
+                        <label class="has-field"><span>服务类型</span><select id="has-profile-type" class="text_pole"><option value="openai-compatible">OpenAI 兼容</option><option value="edge">Edge</option><option value="doubao">豆包原生</option></select></label>
+                        <label class="has-field" data-profile-types="openai-compatible"><span>接口地址</span><input id="has-profile-endpoint" class="text_pole" type="text"></label>
+                        <label class="has-field" data-profile-types="openai-compatible"><span>API Key（共享设置，非加密）</span><input id="has-profile-api-key" class="text_pole" type="password" autocomplete="off"></label>
+                        <label class="has-field" data-profile-types="openai-compatible"><span>模型</span><input id="has-profile-model" class="text_pole" type="text"></label>
+                        <label class="has-field"><span>默认音色</span><input id="has-profile-voice" class="text_pole" type="text"></label>
+                        <label class="has-field" data-profile-types="openai-compatible"><span>请求方式</span><select id="has-profile-request-mode" class="text_pole"><option value="server-proxy">酒馆服务器代理（推荐）</option><option value="direct">浏览器直连</option></select></label>
+                        <div class="has-service-actions">
+                            <button id="has-config-export" class="menu_button" type="button">导出配置</button>
+                            <button id="has-config-import" class="menu_button" type="button">导入配置</button>
+                            <input id="has-config-import-file" type="file" accept="application/json,.json" hidden>
+                        </div>
+
+                        <div class="has-section-title">旧设置兼容</div>
+                        <label class="checkbox_label"><input id="has-read-narration" type="checkbox"><span>读取旁白</span></label>
+                        <label class="checkbox_label"><input id="has-index-proxy" type="checkbox"><span>通过酒馆服务器代理 IndexTTS2（手机推荐）</span></label>
+                        <label class="has-field"><span>IndexTTS2 接口地址</span><input id="has-tts-url" class="text_pole" type="text"></label>
+                        <label class="has-field"><span>IndexTTS2 启动脚本</span><input id="has-index-start-bat" class="text_pole" type="text"></label>
+                        <div class="has-service-actions"><button id="has-check-index" class="menu_button" type="button">检测 IndexTTS2</button><button id="has-start-index" class="menu_button" type="button">启动 API</button></div>
+                        <div id="has-index-status" class="has-service-status has-muted" role="status" aria-live="polite">还未检测 IndexTTS2。</div>
+                        <label class="has-field"><span>IndexTTS2 模型名</span><input id="has-tts-model" class="text_pole" type="text"></label>
+                        <label class="has-field"><span>默认音色</span><input id="has-default-voice" class="text_pole" type="text" placeholder="default.wav"></label>
+                        <label class="has-field"><span>Edge 旁白音色</span><input id="has-edge-voice" class="text_pole" type="text" placeholder="zh-CN-XiaoxiaoNeural"></label>
+                        <div class="has-service-actions"><button id="has-check-edge" class="menu_button" type="button">检测 Edge</button><button id="has-test-edge" class="menu_button" type="button">测试 Edge 朗读</button></div>
+                        <div id="has-edge-status" class="has-service-status has-muted" role="status" aria-live="polite">还未检测 Edge TTS。</div>
+
+                        <div class="has-section-title">缓存与预取</div>
+                        <label class="has-field"><span>预取段数</span><input id="has-prefetch-count" class="text_pole" type="number" inputmode="numeric" min="0" max="2" step="1"></label>
+                        <label class="has-field"><span>共享缓存上限 MB</span><input id="has-shared-cache-max" class="text_pole" type="number" inputmode="numeric" min="64" max="102400" step="64"></label>
+                        <label class="has-field"><span>本机缓存上限 MB</span><input id="has-local-cache-max" class="text_pole" type="number" inputmode="numeric" min="32" max="10240" step="32"></label>
+                        <div class="has-service-actions"><button id="has-cache-stats" class="menu_button" type="button">缓存统计</button><button id="has-multidevice-check" class="menu_button" type="button">多端自检</button><button id="has-prune-shared-cache" class="menu_button" type="button">按上限清理</button><button id="has-clear-shared-cache" class="menu_button" type="button">清理共享缓存</button></div>
+                        <div class="has-service-actions"><button id="has-clear-local-cache" class="menu_button" type="button">清理本机缓存</button><button id="has-cache-help" class="menu_button" type="button">缓存说明</button></div>
+                        <div id="has-cache-status" class="has-service-status has-muted" role="status" aria-live="polite">共享缓存用于 PC/手机复用同一台酒馆服务器上的音频。</div>
+
+                        <div class="has-section-title">特定角色声音</div>
+                        <div id="has-voice-map"></div>
+                        <div class="has-voice-add"><input id="has-add-character" class="text_pole" type="text" placeholder="角色名"><input id="has-add-voice" class="text_pole" type="text" placeholder="音色名"><button id="has-add-voice-row" class="menu_button" type="button">添加</button></div>
+                    </div>
+                </details>
+
+                <details class="has-settings-fold" data-testid="has-legacy-stage-settings">
+                    <summary><i class="fa-solid fa-film" aria-hidden="true"></i><span><strong>旧视频与字幕舞台</strong><small>保留原功能，日常轻量朗读无需设置</small></span></summary>
+                    <div class="has-fold-content">
+                        <label class="has-field"><span>整条有声书使用</span><select id="has-playback-ui" class="text_pole"><option value="player">纯播放器</option><option value="video">视频舞台</option></select></label>
+                        <label class="checkbox_label"><input id="has-enabled" type="checkbox"><span>启用字幕舞台</span></label>
+                        <label class="checkbox_label"><input id="has-auto" type="checkbox"><span>字幕自动播放</span></label>
+                        <label class="checkbox_label"><input id="has-window" type="checkbox"><span>视频舞台使用独立窗口</span></label>
+                        <label class="has-field"><span>视频地址</span><input id="has-video-url" class="text_pole" type="text" placeholder="/scripts/extensions/third-party/HybridAudiobookStage/assets/scene.mp4"></label>
+                        <label class="has-field"><span>视频适配</span><select id="has-video-fit" class="text_pole"><option value="contain">完整显示</option><option value="cover">铺满裁切</option><option value="fill">拉伸填满</option></select></label>
+                        <label class="has-field"><span>每句字幕秒数</span><input id="has-seconds" class="text_pole" type="number" inputmode="decimal" min="1" max="30" step="0.5"></label>
+                        <div class="has-open-actions"><button id="has-open-audiobook" class="menu_button" type="button">听书面板</button><button id="has-open-stage" class="menu_button" type="button">视频舞台</button><button id="has-open-window" class="menu_button" type="button">独立窗口</button></div>
+                    </div>
+                </details>
             </div>
         </div>
     `;
@@ -1534,6 +2137,662 @@ function ensureSettingsPanel() {
     document.querySelector('#extensions_settings')?.appendChild(container);
     syncSettingsPanel(container);
     bindSettingsPanel(container);
+    loadIndexTtsVoiceCatalog(container);
+    const advanced = container.querySelector('[data-testid="has-advanced-settings"]');
+    const legacy = container.querySelector('[data-testid="has-legacy-stage-settings"]');
+    Object.assign(getAudit().lightweight_ui, {
+        status: 'success',
+        error: null,
+        default_sections: container.querySelectorAll(':scope [data-testid^="has-lightweight-step-"]').length,
+        advanced_collapsed: advanced ? !advanced.open : false,
+        legacy_collapsed: legacy ? !legacy.open : false,
+    });
+}
+
+function createStableId(prefix) {
+    const suffix = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    return `${prefix}-${suffix}`;
+}
+
+function fillNamedSelect(select, records, selectedId) {
+    if (!select) return;
+    select.replaceChildren();
+    for (const record of Object.values(records || {})) {
+        if (!record?.id) continue;
+        select.add(new Option(record.name || record.id, record.id, false, record.id === selectedId));
+    }
+}
+
+const CUSTOM_VOICE_OPTION = '__custom_voice__';
+
+function normalizeVoiceSearchText(value) {
+    return String(value || '').normalize('NFKC').toLocaleLowerCase('zh-CN').trim();
+}
+
+function closeVoiceCombobox(control) {
+    const popover = control?.querySelector?.('.has-voice-combobox-popover');
+    const toggle = control?.querySelector?.('.has-voice-combobox-toggle');
+    if (popover) popover.hidden = true;
+    toggle?.setAttribute('aria-expanded', 'false');
+}
+
+function filterVoiceCombobox(control, query = '') {
+    const normalizedQuery = normalizeVoiceSearchText(query);
+    let visibleCount = 0;
+    for (const option of control?.querySelectorAll?.('.has-voice-option') || []) {
+        option.hidden = !matchesVoiceSearch(option.dataset.search, normalizedQuery);
+        if (!option.hidden) visibleCount += 1;
+    }
+    for (const group of control?.querySelectorAll?.('.has-voice-option-group') || []) {
+        group.hidden = !group.querySelector('.has-voice-option:not([hidden])');
+    }
+    const empty = control?.querySelector?.('.has-voice-search-empty');
+    if (empty) empty.hidden = visibleCount > 0;
+}
+
+function setVoiceComboboxValue(control, value, displayLabel = '') {
+    if (!control) return;
+    const normalized = String(value || '').trim();
+    control.dataset.value = normalized;
+    control.value = normalized;
+    const selectedOption = Array.from(control.querySelectorAll('.has-voice-option'))
+        .find(option => option.dataset.value === normalized);
+    const label = displayLabel || selectedOption?.dataset.displayLabel || normalized || '选择音色';
+    const labelNode = control.querySelector('.has-voice-combobox-toggle > span');
+    if (labelNode) labelNode.textContent = label;
+    for (const option of control.querySelectorAll('.has-voice-option')) {
+        const selected = option.dataset.value === normalized;
+        option.classList.toggle('has-selected', selected);
+        option.setAttribute('aria-selected', String(selected));
+    }
+}
+
+function ensureVoiceCombobox(control) {
+    if (!control || control.dataset.comboboxBound === 'true') return;
+    control.dataset.comboboxBound = 'true';
+    const toggle = control.querySelector('.has-voice-combobox-toggle');
+    const popover = control.querySelector('.has-voice-combobox-popover');
+    const search = control.querySelector('.has-voice-search');
+    toggle?.addEventListener('click', event => {
+        event.preventDefault();
+        const opening = popover?.hidden !== false;
+        document.querySelectorAll('.has-voice-combobox').forEach(other => {
+            if (other !== control) closeVoiceCombobox(other);
+        });
+        if (!popover) return;
+        popover.hidden = !opening;
+        toggle.setAttribute('aria-expanded', String(opening));
+        if (opening) {
+            search.value = '';
+            filterVoiceCombobox(control, '');
+            requestAnimationFrame(() => search.focus());
+        }
+    });
+    search?.addEventListener('input', () => filterVoiceCombobox(control, search.value));
+    search?.addEventListener('keydown', event => {
+        if (event.key === 'Escape') {
+            closeVoiceCombobox(control);
+            toggle?.focus();
+        }
+        if (event.key === 'ArrowDown') {
+            event.preventDefault();
+            control.querySelector('.has-voice-option:not([hidden])')?.focus();
+        }
+    });
+    control.querySelector('.has-voice-options')?.addEventListener('click', event => {
+        const option = event.target.closest('.has-voice-option');
+        if (!option) return;
+        event.preventDefault();
+        setVoiceComboboxValue(control, option.dataset.value, option.dataset.displayLabel);
+        closeVoiceCombobox(control);
+        control.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    control.addEventListener('keydown', event => {
+        if (event.key !== 'Escape') return;
+        closeVoiceCombobox(control);
+    });
+    document.addEventListener('pointerdown', event => {
+        if (!control.contains(event.target)) closeVoiceCombobox(control);
+    });
+}
+
+function addVoiceComboboxGroup(host, groupLabel, items) {
+    if (!items.length) return;
+    const group = document.createElement('div');
+    group.className = 'has-voice-option-group';
+    group.dataset.groupLabel = groupLabel;
+    const heading = document.createElement('div');
+    heading.className = 'has-voice-option-heading';
+    heading.textContent = groupLabel;
+    group.append(heading);
+    for (const item of items) {
+        const option = document.createElement('button');
+        option.type = 'button';
+        option.className = 'has-voice-option';
+        option.setAttribute('role', 'option');
+        option.dataset.value = item.value;
+        const primaryLabel = item.name || item.label;
+        const secondaryLabel = item.meta || '';
+        option.dataset.displayLabel = item.selectionLabel || primaryLabel;
+        option.dataset.search = normalizeVoiceSearchText(`${groupLabel} ${primaryLabel} ${secondaryLabel} ${item.label} ${item.value} ${item.searchText || ''}`);
+        option.title = secondaryLabel ? `${primaryLabel}\n${secondaryLabel}` : primaryLabel;
+        const primary = document.createElement('span');
+        primary.className = 'has-voice-option-name';
+        primary.textContent = primaryLabel;
+        option.append(primary);
+        if (secondaryLabel) {
+            const secondary = document.createElement('span');
+            secondary.className = 'has-voice-option-meta';
+            secondary.textContent = secondaryLabel;
+            option.append(secondary);
+        }
+        group.append(option);
+    }
+    host.append(group);
+}
+
+function isIndexTtsProfile(profile) {
+    if (!profile || profile.type !== 'openai-compatible') return false;
+    return profile.id === LEGACY_OPENAI_PROFILE_ID
+        || /index[\s_-]*tts/i.test(String(profile.model || profile.name || ''))
+        || /127\.0\.0\.1:7880|localhost:7880/i.test(String(profile.endpoint || ''));
+}
+
+function getEdgeVoiceReadableName(voice) {
+    const voiceId = String(voice?.voiceId || '').trim();
+    const locale = String(voice?.locale || '').trim();
+    return locale && voiceId.startsWith(`${locale}-`) ? voiceId.slice(locale.length + 1) : voiceId;
+}
+
+function fillRouteVoiceSelect(select, settings, profileId, selectedVoice = '') {
+    if (!select) return;
+    ensureVoiceCombobox(select);
+    const voices = collectProfileVoiceOptions(settings, profileId, selectedVoice);
+    const selected = String(selectedVoice || '').trim();
+    const profile = settings?.providerProfiles?.[profileId];
+    const isDoubao = profile?.type === 'doubao';
+    const isEdge = profile?.type === 'edge';
+    const isIndexTts = isIndexTtsProfile(profile);
+    const host = select.querySelector('.has-voice-options');
+    host.replaceChildren();
+    const usedItems = [];
+    for (const voiceId of voices) {
+        const catalogVoice = isDoubao ? getDoubaoCatboxVoice(voiceId) : null;
+        const edgeVoice = isEdge ? getEdgeCatalogVoice(voiceId) : null;
+        if (catalogVoice) {
+            usedItems.push({
+                value: voiceId,
+                label: catalogVoice.name,
+                name: catalogVoice.name,
+                meta: voiceId,
+                selectionLabel: catalogVoice.name,
+            });
+        } else if (edgeVoice) {
+            const name = getEdgeVoiceReadableName(edgeVoice);
+            usedItems.push({
+                value: voiceId,
+                label: name,
+                name,
+                meta: `${edgeVoice.locale} · ${edgeVoice.gender} · ${voiceId}`,
+                selectionLabel: `${name} · ${edgeVoice.locale}`,
+            });
+        } else if (isIndexTts && /\.wav$/i.test(voiceId)) {
+            const name = voiceId.replace(/\.wav$/i, '');
+            usedItems.push({ value: voiceId, label: name, name, meta: voiceId, selectionLabel: name });
+        } else {
+            usedItems.push({ value: voiceId, label: voiceId });
+        }
+    }
+    addVoiceComboboxGroup(host, voices.length ? '已使用的音色' : '尚无已使用音色', usedItems);
+
+    if (isDoubao) {
+        addVoiceComboboxGroup(host, '添加音色', [{ value: CUSTOM_VOICE_OPTION, label: '手动添加音色 ID…' }]);
+        const usedVoiceIds = new Set(voices);
+        for (const group of DOUBAO_CATBOX_VOICE_GROUPS) {
+            const items = [];
+            for (const voice of group.voices) {
+                if (usedVoiceIds.has(voice.voiceId)) continue;
+                items.push({
+                    value: voice.voiceId,
+                    label: voice.name,
+                    name: voice.name,
+                    meta: voice.voiceId,
+                    selectionLabel: voice.name,
+                });
+            }
+            addVoiceComboboxGroup(host, `${group.label}（Seed ICL 2.0）`, items);
+        }
+    } else if (isEdge) {
+        for (const group of getPrioritizedEdgeVoiceGroups(voices)) {
+            const items = group.voices.map(voice => {
+                const name = getEdgeVoiceReadableName(voice);
+                const genderSearch = voice.gender === 'Male' ? '男 男声 male' : '女 女声 female';
+                return {
+                    value: voice.voiceId,
+                    label: name,
+                    name,
+                    meta: `${voice.locale} · ${voice.gender} · ${voice.voiceId}`,
+                    selectionLabel: `${name} · ${voice.locale}`,
+                    searchText: `${voice.locale} ${voice.gender} ${genderSearch}`,
+                };
+            });
+            addVoiceComboboxGroup(host, group.label, items);
+        }
+        addVoiceComboboxGroup(host, '添加音色', [{ value: CUSTOM_VOICE_OPTION, label: '手动添加音色 ID…' }]);
+    } else if (isIndexTts) {
+        const usedVoiceIds = new Set(voices);
+        addVoiceComboboxGroup(host, 'IndexTTS2 · ckyp 音色', indexTtsVoiceCatalog
+            .filter(voiceId => !usedVoiceIds.has(voiceId))
+            .map(voiceId => ({
+                value: voiceId,
+                label: voiceId.replace(/\.wav$/i, ''),
+                name: voiceId.replace(/\.wav$/i, ''),
+                meta: voiceId,
+                searchText: 'IndexTTS2 ckyp',
+            })));
+        addVoiceComboboxGroup(host, '添加音色', [{ value: CUSTOM_VOICE_OPTION, label: '手动添加音色 ID…' }]);
+    } else {
+        addVoiceComboboxGroup(host, '添加音色', [{ value: CUSTOM_VOICE_OPTION, label: '手动添加音色 ID…' }]);
+    }
+    const empty = document.createElement('div');
+    empty.className = 'has-voice-search-empty';
+    empty.textContent = '没有匹配的音色';
+    empty.hidden = true;
+    host.append(empty);
+    setVoiceComboboxValue(select, voices.includes(selected) ? selected : (voices[0] || ''));
+}
+
+function warnIfDoubaoIclResourceMismatch(profile, voiceId) {
+    if (profile?.type !== 'doubao' || !isDoubaoCatboxVoice(voiceId)) return;
+    if (String(profile.resourceId || 'seed-tts-2.0') === DOUBAO_ICL_RESOURCE_ID) return;
+    toastWarn('这个猫箱同款音色需要 Seed ICL 2.0；请在第 2 步把“资源类型”切换为 Seed ICL 2.0。');
+}
+
+function getActivePreset(settings = getSettings()) {
+    return settings.routingPresets?.[settings.activeRoutingPresetId] || null;
+}
+
+function getEditingProfile(settings = getSettings()) {
+    const profiles = settings.providerProfiles || {};
+    if (!profiles[settings.editingProviderProfileId]) {
+        settings.editingProviderProfileId = Object.keys(profiles)[0] || '';
+    }
+    return profiles[settings.editingProviderProfileId] || null;
+}
+
+function getSelectedProfile(container, settings = getSettings()) {
+    const selectedId = String(container?.querySelector?.('#has-profile-select')?.value || '').trim();
+    if (selectedId && settings.providerProfiles?.[selectedId]) {
+        settings.editingProviderProfileId = selectedId;
+        return settings.providerProfiles[selectedId];
+    }
+    return getEditingProfile(settings);
+}
+
+function syncRouteModeVisibility(container, mode = 'mixed') {
+    const activeMode = ['mixed', 'dialogue-only', 'single-voice'].includes(mode) ? mode : 'mixed';
+    for (const field of container?.querySelectorAll?.('[data-route-modes]') || []) {
+        field.hidden = !String(field.dataset.routeModes || '').split(/\s+/).includes(activeMode);
+    }
+    const help = container?.querySelector?.('#has-route-help');
+    if (help) {
+        help.textContent = activeMode === 'mixed'
+            ? '旁白和角色可以使用不同服务与音色。'
+            : activeMode === 'dialogue-only'
+                ? '只朗读已识别的角色台词，不读旁白。'
+                : '整段正文使用同一个服务和音色。';
+    }
+}
+
+function renderRouteOverrideWarning(container, preset) {
+    const warning = container?.querySelector?.('#has-route-override-warning');
+    const text = container?.querySelector?.('#has-route-override-warning-text');
+    if (!warning || !text) return;
+    const summary = summarizeCharacterOverrides(preset, LEGACY_OPENAI_PROFILE_ID);
+    warning.hidden = summary.matchingProfile < 1;
+    if (warning.hidden) {
+        text.textContent = '';
+        return;
+    }
+    text.textContent = `${summary.matchingProfile} 个特定角色仍使用 IndexTTS2（迁移），会覆盖上面的“角色默认使用”。`;
+}
+
+function syncProfileTypeVisibility(container, profile) {
+    const type = profile?.type || 'openai-compatible';
+    for (const field of container?.querySelectorAll?.('[data-profile-types]') || []) {
+        field.hidden = !String(field.dataset.profileTypes || '').split(/\s+/).includes(type);
+    }
+    const doubaoQuick = container?.querySelector?.('#has-doubao-quick');
+    if (doubaoQuick) doubaoQuick.hidden = type !== 'doubao';
+}
+
+function renderTtsConfiguration(container = document.getElementById('has-settings')) {
+    if (!container) return;
+    const settings = getSettings();
+    const preset = getActivePreset(settings);
+    const profile = getEditingProfile(settings);
+
+    fillNamedSelect(container.querySelector('#has-preset-select'), settings.routingPresets, settings.activeRoutingPresetId);
+    fillNamedSelect(container.querySelector('#has-profile-select'), settings.providerProfiles, settings.editingProviderProfileId);
+    for (const selector of ['#has-route-narration-profile', '#has-route-dialogue-profile', '#has-route-single-profile']) {
+        fillNamedSelect(container.querySelector(selector), settings.providerProfiles, '');
+    }
+
+    if (preset) {
+        container.querySelector('#has-preset-mode').value = preset.mode || 'mixed';
+        container.querySelector('#has-route-narration-profile').value = preset.narration?.profileId || '';
+        container.querySelector('#has-route-dialogue-profile').value = preset.dialogueDefault?.profileId || '';
+        container.querySelector('#has-route-single-profile').value = preset.singleVoice?.profileId || '';
+        fillRouteVoiceSelect(container.querySelector('#has-route-narration-voice'), settings, preset.narration?.profileId, preset.narration?.voiceId);
+        fillRouteVoiceSelect(container.querySelector('#has-route-dialogue-voice'), settings, preset.dialogueDefault?.profileId, preset.dialogueDefault?.voiceId);
+        fillRouteVoiceSelect(container.querySelector('#has-route-single-voice'), settings, preset.singleVoice?.profileId, preset.singleVoice?.voiceId);
+    }
+    syncRouteModeVisibility(container, preset?.mode || 'mixed');
+    renderRouteOverrideWarning(container, preset);
+
+    if (profile) {
+        container.querySelector('#has-profile-name').value = profile.name || '';
+        container.querySelector('#has-profile-type').value = profile.type || 'openai-compatible';
+        container.querySelector('#has-profile-endpoint').value = profile.endpoint || '';
+        container.querySelector('#has-profile-api-key').value = profile.apiKey || '';
+        container.querySelector('#has-profile-model').value = profile.model || '';
+        container.querySelector('#has-profile-voice').value = profile.type === 'edge' ? (profile.edgeVoice || '') : (profile.defaultVoice || '');
+        container.querySelector('#has-profile-request-mode').value = profile.requestMode || 'server-proxy';
+        container.querySelector('#has-doubao-app-id').value = profile.appId || '';
+        container.querySelector('#has-doubao-access-key').value = profile.accessKey || '';
+        container.querySelector('#has-doubao-resource-id').value = profile.resourceId || 'seed-tts-2.0';
+        container.querySelector('#has-doubao-speaker-id').value = profile.defaultVoice || '';
+        container.querySelector('#has-doubao-context-text').value = profile.contextText || '';
+    }
+    syncProfileTypeVisibility(container, profile);
+}
+
+function profileReferences(profileId, settings = getSettings()) {
+    const references = [];
+    for (const preset of Object.values(settings.routingPresets || {})) {
+        const used = preset?.narration?.profileId === profileId
+            || preset?.dialogueDefault?.profileId === profileId
+            || preset?.singleVoice?.profileId === profileId
+            || Object.values(preset?.characterOverrides || {}).some(route => route?.profileId === profileId);
+        if (used) references.push(preset.name || preset.id);
+    }
+    return references;
+}
+
+function downloadTtsConfiguration(settings = getSettings()) {
+    const blob = new Blob([JSON.stringify({
+        version: 3,
+        providerProfiles: settings.providerProfiles,
+        routingPresets: settings.routingPresets,
+        activeRoutingPresetId: settings.activeRoutingPresetId,
+    }, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `HybridAudiobookStage-TTS-${new Date().toISOString().slice(0, 10)}.json`;
+    anchor.click();
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+function bindTtsConfiguration(container, settings) {
+    container.querySelector('#has-preset-select')?.addEventListener('change', event => {
+        settings.activeRoutingPresetId = event.target.value;
+        const preset = getActivePreset(settings);
+        settings.readNarration = preset?.mode !== 'dialogue-only';
+        saveSettings();
+        syncSettingsPanel(container);
+        refreshMessageButtons();
+    });
+    container.querySelector('#has-preset-new')?.addEventListener('click', () => {
+        const name = prompt('新预设名称', '新朗读预设')?.trim();
+        if (!name) return;
+        const source = getActivePreset(settings);
+        const id = createStableId('preset');
+        settings.routingPresets[id] = structuredClone({ ...source, id, name });
+        settings.activeRoutingPresetId = id;
+        saveSettings();
+        syncSettingsPanel(container);
+    });
+    container.querySelector('#has-preset-copy')?.addEventListener('click', () => {
+        const source = getActivePreset(settings);
+        if (!source) return;
+        const id = createStableId('preset');
+        settings.routingPresets[id] = structuredClone({ ...source, id, name: `${source.name || '预设'} 副本` });
+        settings.activeRoutingPresetId = id;
+        saveSettings();
+        syncSettingsPanel(container);
+    });
+    container.querySelector('#has-preset-rename')?.addEventListener('click', () => {
+        const preset = getActivePreset(settings);
+        if (!preset) return;
+        const name = prompt('预设名称', preset.name || '')?.trim();
+        if (!name) return;
+        preset.name = name;
+        saveSettings();
+        renderTtsConfiguration(container);
+    });
+    container.querySelector('#has-preset-delete')?.addEventListener('click', () => {
+        const ids = Object.keys(settings.routingPresets || {});
+        if (ids.length <= 1) return toastWarn('至少保留一套朗读预设');
+        if (!confirm('确定删除当前朗读预设吗？')) return;
+        delete settings.routingPresets[settings.activeRoutingPresetId];
+        settings.activeRoutingPresetId = Object.keys(settings.routingPresets)[0];
+        saveSettings();
+        syncSettingsPanel(container);
+    });
+
+    const updatePreset = () => {
+        const preset = getActivePreset(settings);
+        if (!preset) return;
+        preset.mode = container.querySelector('#has-preset-mode').value;
+        preset.narration = {
+            profileId: container.querySelector('#has-route-narration-profile').value,
+            voiceId: container.querySelector('#has-route-narration-voice').value,
+        };
+        preset.dialogueDefault = {
+            profileId: container.querySelector('#has-route-dialogue-profile').value,
+            voiceId: container.querySelector('#has-route-dialogue-voice').value,
+        };
+        preset.singleVoice = {
+            profileId: container.querySelector('#has-route-single-profile').value,
+            voiceId: container.querySelector('#has-route-single-voice').value,
+        };
+        settings.readNarration = preset.mode !== 'dialogue-only';
+        saveSettings();
+        syncRouteModeVisibility(container, preset.mode);
+        renderVoiceMap(container);
+        refreshMessageButtons();
+    };
+    container.querySelector('#has-preset-mode')?.addEventListener('change', updatePreset);
+    const routeControls = [
+        ['#has-route-narration-profile', '#has-route-narration-voice', 'narration'],
+        ['#has-route-dialogue-profile', '#has-route-dialogue-voice', 'dialogueDefault'],
+        ['#has-route-single-profile', '#has-route-single-voice', 'singleVoice'],
+    ];
+    for (const [profileSelector, voiceSelector, routeKey] of routeControls) {
+        const profileSelect = container.querySelector(profileSelector);
+        const voiceSelect = container.querySelector(voiceSelector);
+        profileSelect?.addEventListener('change', () => {
+            const profileId = profileSelect.value;
+            const voiceId = chooseProfileVoice(settings, profileId);
+            fillRouteVoiceSelect(voiceSelect, settings, profileId, voiceId);
+            updatePreset();
+        });
+        voiceSelect?.addEventListener('change', () => {
+            if (voiceSelect.value !== CUSTOM_VOICE_OPTION) {
+                const profileId = profileSelect?.value || '';
+                const voiceId = voiceSelect.value;
+                const profile = settings.providerProfiles?.[profileId];
+                warnIfDoubaoIclResourceMismatch(profile, voiceId);
+                rememberProfileVoice(profile, voiceId);
+                updatePreset();
+                fillRouteVoiceSelect(voiceSelect, settings, profileId, voiceId);
+                return;
+            }
+            const profileId = profileSelect?.value || '';
+            const profile = settings.providerProfiles?.[profileId];
+            const voiceId = prompt('输入新的音色 ID', '')?.trim();
+            if (!voiceId || !profile) {
+                const previous = getActivePreset(settings)?.[routeKey]?.voiceId || '';
+                fillRouteVoiceSelect(voiceSelect, settings, profileId, previous);
+                return;
+            }
+            rememberProfileVoice(profile, voiceId);
+            fillRouteVoiceSelect(voiceSelect, settings, profileId, voiceId);
+            warnIfDoubaoIclResourceMismatch(profile, voiceId);
+            updatePreset();
+        });
+    }
+
+    container.querySelector('#has-clear-legacy-index-overrides')?.addEventListener('click', () => {
+        const preset = getActivePreset(settings);
+        const summary = summarizeCharacterOverrides(preset, LEGACY_OPENAI_PROFILE_ID);
+        if (!summary.matchingProfile) return renderRouteOverrideWarning(container, preset);
+        if (!confirm(`确定清除 ${summary.matchingProfile} 个仍指向 IndexTTS2（迁移）的特定角色覆盖吗？这些角色之后会跟随“角色默认使用”。`)) return;
+        const removed = removeCharacterOverridesByProfile(
+            preset,
+            LEGACY_OPENAI_PROFILE_ID,
+            settings.voiceMap,
+        );
+        saveSettings();
+        renderTtsConfiguration(container);
+        renderVoiceMap(container);
+        refreshMessageButtons();
+        toastSuccess(`已清除 ${removed.length} 个旧 Index 角色覆盖`);
+    });
+
+    container.querySelector('#has-profile-select')?.addEventListener('change', event => {
+        settings.editingProviderProfileId = event.target.value;
+        saveSettings();
+        renderTtsConfiguration(container);
+    });
+    container.querySelector('#has-profile-new')?.addEventListener('click', () => {
+        const id = createStableId('profile');
+        settings.providerProfiles[id] = {
+            id, name: '新 TTS Profile', type: 'openai-compatible', enabled: true,
+            endpoint: '', apiKey: '', model: '', defaultVoice: '', responseFormat: 'wav', extraBody: {}, requestMode: 'server-proxy',
+        };
+        settings.editingProviderProfileId = id;
+        saveSettings();
+        renderTtsConfiguration(container);
+    });
+    container.querySelector('#has-profile-copy')?.addEventListener('click', () => {
+        const profile = getEditingProfile(settings);
+        if (!profile) return;
+        const id = createStableId('profile');
+        settings.providerProfiles[id] = structuredClone({ ...profile, id, name: `${profile.name || 'Profile'} 副本` });
+        settings.editingProviderProfileId = id;
+        saveSettings();
+        renderTtsConfiguration(container);
+    });
+    container.querySelector('#has-profile-delete')?.addEventListener('click', () => {
+        const profile = getEditingProfile(settings);
+        if (!profile) return;
+        const references = profileReferences(profile.id, settings);
+        if (references.length) return toastWarn(`该 Profile 正被预设使用：${references.join('、')}`);
+        delete settings.providerProfiles[profile.id];
+        settings.editingProviderProfileId = Object.keys(settings.providerProfiles)[0] || '';
+        saveSettings();
+        renderTtsConfiguration(container);
+    });
+
+    const updateProfile = () => {
+        const profile = getEditingProfile(settings);
+        if (!profile) return;
+        profile.name = container.querySelector('#has-profile-name').value.trim() || profile.id;
+        profile.type = container.querySelector('#has-profile-type').value;
+        profile.endpoint = container.querySelector('#has-profile-endpoint').value.trim();
+        profile.apiKey = container.querySelector('#has-profile-api-key').value;
+        profile.model = container.querySelector('#has-profile-model').value.trim();
+        profile.requestMode = container.querySelector('#has-profile-request-mode').value;
+        const voice = container.querySelector('#has-profile-voice').value.trim();
+        if (profile.type === 'edge') profile.edgeVoice = voice;
+        else profile.defaultVoice = voice;
+        if (profile.type === 'doubao') {
+            profile.resourceId ||= 'seed-tts-2.0';
+            profile.requestMode = 'server-proxy';
+        }
+        saveSettings();
+        renderTtsConfiguration(container);
+    };
+    for (const selector of [
+        '#has-profile-name', '#has-profile-type', '#has-profile-endpoint', '#has-profile-api-key',
+        '#has-profile-model', '#has-profile-voice', '#has-profile-request-mode',
+    ]) container.querySelector(selector)?.addEventListener('change', updateProfile);
+
+    const updateDoubaoProfile = () => {
+        const profile = getSelectedProfile(container, settings);
+        if (!profile || profile.type !== 'doubao') return;
+        profile.appId = container.querySelector('#has-doubao-app-id').value.trim();
+        profile.accessKey = container.querySelector('#has-doubao-access-key').value;
+        profile.resourceId = container.querySelector('#has-doubao-resource-id').value || 'seed-tts-2.0';
+        profile.defaultVoice = container.querySelector('#has-doubao-speaker-id').value.trim();
+        profile.contextText = container.querySelector('#has-doubao-context-text').value.trim();
+        profile.requestMode = 'server-proxy';
+        saveSettings();
+        renderTtsConfiguration(container);
+        refreshMessageButtons();
+    };
+    for (const selector of [
+        '#has-doubao-app-id', '#has-doubao-access-key', '#has-doubao-resource-id',
+        '#has-doubao-speaker-id', '#has-doubao-context-text',
+    ]) container.querySelector(selector)?.addEventListener('change', updateDoubaoProfile);
+
+    container.querySelector('#has-profile-test')?.addEventListener('click', async () => {
+        const audit = beginAuditRun('provider-probe');
+        const profile = getSelectedProfile(container, settings);
+        setServiceStatus('has-provider-status', '正在检测 Provider...', 'muted');
+        try {
+            const result = await providerRegistry.probe(profile);
+            Object.assign(audit.provider_ready, {
+                status: 'success', error: null, profile_id: profile.id, provider_type: profile.type, probe_ok: result.ok !== false,
+            });
+            setServiceStatus(
+                'has-provider-status',
+                result.unverified
+                    ? `配置完整：${profile.name}，请点击“试听声音”完成真实 API 验证`
+                    : `连接成功：${profile.name}`,
+                'ok',
+            );
+        } catch (error) {
+            Object.assign(audit.provider_ready, {
+                status: 'fail', error: error.message, profile_id: profile?.id || null, provider_type: profile?.type || null, probe_ok: false,
+            });
+            audit.last_error = error?.message || String(error);
+            setServiceStatus('has-provider-status', `连接失败：${error.message}`, 'bad');
+        }
+    });
+    container.querySelector('#has-profile-preview')?.addEventListener('click', async () => {
+        const profile = getSelectedProfile(container, settings);
+        if (!profile) return;
+        const voiceId = profile.type === 'edge'
+            ? String(profile.edgeVoice || '').trim()
+            : String(profile.defaultVoice || '').trim();
+        const text = container.querySelector('#has-profile-preview-text').value.trim();
+        await playLightweightText(text, { source: 'preview', profileId: profile.id, voiceId });
+    });
+    container.querySelector('#has-profile-preview-stop')?.addEventListener('click', stopCurrentPlayback);
+
+    container.querySelector('#has-config-export')?.addEventListener('click', () => downloadTtsConfiguration(settings));
+    container.querySelector('#has-config-import')?.addEventListener('click', () => container.querySelector('#has-config-import-file')?.click());
+    container.querySelector('#has-config-import-file')?.addEventListener('change', async event => {
+        const file = event.target.files?.[0];
+        event.target.value = '';
+        if (!file) return;
+        try {
+            const data = JSON.parse(await file.text());
+            if (!data.providerProfiles || !data.routingPresets) throw new Error('文件缺少 Provider 或预设数据');
+            settings.providerProfiles = { ...settings.providerProfiles, ...data.providerProfiles };
+            settings.routingPresets = { ...settings.routingPresets, ...data.routingPresets };
+            if (settings.routingPresets[data.activeRoutingPresetId]) settings.activeRoutingPresetId = data.activeRoutingPresetId;
+            ensureTtsSettingsV2(settings);
+            saveSettings();
+            syncSettingsPanel(container);
+            toastSuccess('TTS 配置已导入');
+        } catch (error) {
+            toastError(`导入失败：${error.message}`);
+        }
+    });
 }
 
 function syncSettingsPanel(container = document.getElementById('has-settings')) {
@@ -1550,9 +2809,13 @@ function syncSettingsPanel(container = document.getElementById('has-settings')) 
     container.querySelector('#has-default-voice').value = settings.defaultVoice || defaultSettings.defaultVoice;
     container.querySelector('#has-edge-voice').value = settings.edgeVoice || defaultSettings.edgeVoice;
     container.querySelector('#has-shared-cache-max').value = String(normalizeCacheLimitMb(settings.sharedAudioCacheMaxMb));
-    container.querySelector('#has-speed').value = String(settings.speed || 1);
+    container.querySelector('#has-local-cache-max').value = String(Math.max(32, Math.min(10240, Number(settings.localAudioCacheMaxMb) || 512)));
+    container.querySelector('#has-speed').value = String(settings.playbackRate || 1);
+    container.querySelector('#has-synthesis-speed').value = String(settings.synthesisSpeed || 1);
+    container.querySelector('#has-prefetch-count').value = String(Math.max(0, Math.min(2, Number(settings.prefetchCount) || 2)));
     container.querySelector('#has-volume').value = String(settings.volume ?? 1);
-    container.querySelector('#has-speed-value').textContent = `${Number(settings.speed || 1).toFixed(1)}x`;
+    container.querySelector('#has-speed-value').textContent = `${Number(settings.playbackRate || 1).toFixed(1)}x`;
+    container.querySelector('#has-synthesis-speed-value').textContent = `${Number(settings.synthesisSpeed || 1).toFixed(1)}x`;
     container.querySelector('#has-volume-value').textContent = Number(settings.volume ?? 1).toFixed(2);
     container.querySelector('#has-enabled').checked = !!settings.enabled;
     container.querySelector('#has-auto').checked = !!settings.autoAdvance;
@@ -1560,6 +2823,7 @@ function syncSettingsPanel(container = document.getElementById('has-settings')) 
     container.querySelector('#has-video-url').value = settings.videoUrl || defaultSettings.videoUrl;
     container.querySelector('#has-video-fit').value = settings.videoFit || defaultSettings.videoFit;
     container.querySelector('#has-seconds').value = String(settings.secondsPerSubtitle || defaultSettings.secondsPerSubtitle);
+    renderTtsConfiguration(container);
     renderVoiceMap(container);
 }
 
@@ -1567,33 +2831,55 @@ function renderVoiceMap(container = document.getElementById('has-settings')) {
     const root = container?.querySelector('#has-voice-map');
     if (!root) return;
     const settings = getSettings();
-    const entries = Object.entries(settings.voiceMap || {}).sort(([a], [b]) => a.localeCompare(b, 'zh-Hans-CN'));
+    const preset = getActivePreset(settings);
+    preset.characterOverrides ||= {};
+    const legacyEntries = Object.fromEntries(Object.entries(settings.voiceMap || {}).map(([character, voiceId]) => [character, {
+        profileId: preset.dialogueDefault?.profileId || LEGACY_OPENAI_PROFILE_ID,
+        voiceId,
+    }]));
+    const overrides = { ...legacyEntries, ...preset.characterOverrides };
+    const entries = Object.entries(overrides).sort(([a], [b]) => a.localeCompare(b, 'zh-Hans-CN'));
     root.innerHTML = entries.length ? '' : '<div class="has-empty">还没有配置角色音色。</div>';
-    for (const [character, voice] of entries) {
+    for (const [character, route] of entries) {
         const row = document.createElement('div');
         row.className = 'has-voice-row';
         row.innerHTML = `
             <input class="text_pole has-character" type="text">
+            <select class="text_pole has-character-profile"></select>
             <input class="text_pole has-voice" type="text">
             <button class="menu_button has-delete-voice" type="button">删除</button>
         `;
         row.querySelector('.has-character').value = character;
-        row.querySelector('.has-voice').value = voice;
+        fillNamedSelect(row.querySelector('.has-character-profile'), settings.providerProfiles, route.profileId);
+        row.querySelector('.has-character-profile').value = route.profileId || '';
+        row.querySelector('.has-voice').value = route.voiceId || '';
         row.querySelector('.has-character').addEventListener('change', event => {
             const nextCharacter = event.target.value.trim();
             if (!nextCharacter || nextCharacter === character) return;
-            settings.voiceMap[nextCharacter] = settings.voiceMap[character];
+            preset.characterOverrides[nextCharacter] = preset.characterOverrides[character] || route;
+            settings.voiceMap[nextCharacter] = preset.characterOverrides[nextCharacter].voiceId;
+            delete preset.characterOverrides[character];
             delete settings.voiceMap[character];
             saveSettings();
             renderVoiceMap(container);
             refreshMessageButtons();
         });
+        row.querySelector('.has-character-profile').addEventListener('change', event => {
+            preset.characterOverrides[character] ||= { profileId: '', voiceId: route.voiceId || '' };
+            preset.characterOverrides[character].profileId = event.target.value;
+            saveSettings();
+            refreshMessageButtons();
+        });
         row.querySelector('.has-voice').addEventListener('change', event => {
-            settings.voiceMap[character] = ensureWavSuffix(event.target.value);
+            const voiceId = event.target.value.trim();
+            preset.characterOverrides[character] ||= { profileId: route.profileId || preset.dialogueDefault?.profileId || '', voiceId: '' };
+            preset.characterOverrides[character].voiceId = voiceId;
+            settings.voiceMap[character] = voiceId;
             saveSettings();
             refreshMessageButtons();
         });
         row.querySelector('.has-delete-voice').addEventListener('click', () => {
+            delete preset.characterOverrides[character];
             delete settings.voiceMap[character];
             saveSettings();
             renderVoiceMap(container);
@@ -1605,6 +2891,7 @@ function renderVoiceMap(container = document.getElementById('has-settings')) {
 
 function bindSettingsPanel(container) {
     const settings = getSettings();
+    bindTtsConfiguration(container, settings);
     const bindCheckbox = (selector, key, after = null) => {
         container.querySelector(selector)?.addEventListener('change', event => {
             settings[key] = event.target.checked;
@@ -1620,7 +2907,12 @@ function bindSettingsPanel(container) {
     };
 
     bindCheckbox('#has-tts-enabled', 'ttsEnabled');
-    bindCheckbox('#has-read-narration', 'readNarration');
+    bindCheckbox('#has-read-narration', 'readNarration', () => {
+        const preset = getActivePreset(settings);
+        if (preset) preset.mode = settings.readNarration === false ? 'dialogue-only' : 'mixed';
+        saveSettings();
+        renderTtsConfiguration(container);
+    });
     bindCheckbox('#has-shared-cache', 'sharedAudioCacheEnabled');
     bindCheckbox('#has-index-proxy', 'useServerIndexTtsProxy');
     bindInput('#has-playback-ui', 'audiobookPlaybackUi', value => value === 'player' ? 'player' : 'video');
@@ -1630,9 +2922,21 @@ function bindSettingsPanel(container) {
     bindInput('#has-default-voice', 'defaultVoice', ensureWavSuffix);
     bindInput('#has-edge-voice', 'edgeVoice', value => value.trim() || defaultSettings.edgeVoice);
     bindInput('#has-shared-cache-max', 'sharedAudioCacheMaxMb', normalizeCacheLimitMb);
+    bindInput('#has-local-cache-max', 'localAudioCacheMaxMb', value => Math.max(32, Math.min(10240, Number(value) || 512)));
     container.querySelector('#has-speed')?.addEventListener('input', event => {
-        settings.speed = Number(event.target.value) || 1;
-        container.querySelector('#has-speed-value').textContent = `${settings.speed.toFixed(1)}x`;
+        settings.playbackRate = Number(event.target.value) || 1;
+        container.querySelector('#has-speed-value').textContent = `${settings.playbackRate.toFixed(1)}x`;
+        if (currentPlayback.audio) currentPlayback.audio.playbackRate = settings.playbackRate;
+        saveSettings();
+    });
+    container.querySelector('#has-synthesis-speed')?.addEventListener('input', event => {
+        settings.synthesisSpeed = Number(event.target.value) || 1;
+        container.querySelector('#has-synthesis-speed-value').textContent = `${settings.synthesisSpeed.toFixed(1)}x`;
+        saveSettings();
+    });
+    container.querySelector('#has-prefetch-count')?.addEventListener('change', event => {
+        settings.prefetchCount = Math.max(0, Math.min(2, Number(event.target.value) || 0));
+        event.target.value = String(settings.prefetchCount);
         saveSettings();
     });
     container.querySelector('#has-volume')?.addEventListener('input', event => {
@@ -1645,17 +2949,44 @@ function bindSettingsPanel(container) {
         const characterInput = container.querySelector('#has-add-character');
         const voiceInput = container.querySelector('#has-add-voice');
         const character = characterInput.value.trim();
-        const voice = ensureWavSuffix(voiceInput.value);
+        const voice = voiceInput.value.trim();
         if (!character) {
             toastWarn('请先填写角色名');
             return;
         }
         settings.voiceMap[character] = voice;
+        const preset = getActivePreset(settings);
+        preset.characterOverrides ||= {};
+        preset.characterOverrides[character] = {
+            profileId: preset.dialogueDefault?.profileId || LEGACY_OPENAI_PROFILE_ID,
+            voiceId: voice,
+        };
         characterInput.value = '';
         voiceInput.value = '';
         saveSettings();
         renderVoiceMap(container);
         refreshMessageButtons();
+    });
+
+    container.querySelector('#has-tts-url')?.addEventListener('change', () => {
+        const profile = settings.providerProfiles?.[LEGACY_OPENAI_PROFILE_ID];
+        if (profile) profile.endpoint = settings.ttsApiUrl;
+        saveSettings();
+    });
+    container.querySelector('#has-tts-model')?.addEventListener('change', () => {
+        const profile = settings.providerProfiles?.[LEGACY_OPENAI_PROFILE_ID];
+        if (profile) profile.model = settings.ttsModel;
+        saveSettings();
+    });
+    container.querySelector('#has-default-voice')?.addEventListener('change', () => {
+        const profile = settings.providerProfiles?.[LEGACY_OPENAI_PROFILE_ID];
+        if (profile) profile.defaultVoice = settings.defaultVoice;
+        saveSettings();
+    });
+    container.querySelector('#has-edge-voice')?.addEventListener('change', () => {
+        const profile = settings.providerProfiles?.[LEGACY_EDGE_PROFILE_ID];
+        if (profile) profile.edgeVoice = settings.edgeVoice;
+        saveSettings();
     });
 
     bindCheckbox('#has-enabled', 'enabled', ensureLauncher);
@@ -2207,6 +3538,11 @@ function previousSegment() {
 }
 
 function closeStage() {
+    if (stageState.linked && currentPlayback.session) {
+        stopCurrentPlayback();
+        document.getElementById('has-stage')?.classList.remove('has-open');
+        return;
+    }
     pausePlayback();
     document.getElementById('has-stage')?.classList.remove('has-open');
 }
@@ -2287,20 +3623,149 @@ function injectMessageButtons(msg) {
     group.className = 'has-msg-buttons';
     group.innerHTML = `
         <button class="has-floating-action has-play-msg" type="button" title="有声书播放 <content>"><i class="fa-solid fa-volume-high"></i></button>
-        <button class="has-floating-action has-infer-msg" type="button" title="预生成人物台词"><i class="fa-solid fa-wand-magic-sparkles"></i></button>
-        <button class="has-floating-action has-check-msg" type="button" title="检查台词标签与音色"><i class="fa-solid fa-list-check"></i></button>
-        <button class="has-floating-action has-config-msg" type="button" title="配置有声书 TTS"><i class="fa-solid fa-cog"></i></button>
+        <button class="has-floating-action has-play-selection" type="button" title="朗读选中文字"><i class="fa-solid fa-i-cursor"></i></button>
+        <button class="has-floating-action has-play-paragraph" type="button" title="朗读当前段落"><i class="fa-solid fa-paragraph"></i></button>
+        <details class="has-msg-more">
+            <summary title="更多 TTS 操作" aria-label="更多 TTS 操作"><i class="fa-solid fa-ellipsis"></i></summary>
+            <div class="has-msg-more-menu">
+                <button class="has-floating-action has-infer-msg" type="button" title="预生成人物台词"><i class="fa-solid fa-wand-magic-sparkles"></i><span>预生成角色台词</span></button>
+                <button class="has-floating-action has-check-msg" type="button" title="检查台词标签与音色"><i class="fa-solid fa-list-check"></i><span>检查台词与音色</span></button>
+                <button class="has-floating-action has-config-msg" type="button" title="打开轻量 TTS 设置"><i class="fa-solid fa-cog"></i><span>打开 TTS 设置</span></button>
+            </div>
+        </details>
     `;
     target.prepend(group);
 }
 
-function createInlineDialogueButton(index, dialogue) {
+function captureLatestTextSelection() {
+    const selection = window.getSelection?.();
+    const text = normalizeWhitespace(selection?.toString?.() || '');
+    if (!text || !selection?.rangeCount) return;
+    const range = selection.getRangeAt(0);
+    const node = range.commonAncestorContainer?.nodeType === Node.TEXT_NODE
+        ? range.commonAncestorContainer.parentElement
+        : range.commonAncestorContainer;
+    const msg = node?.closest?.('.mes');
+    if (!msg || !node?.closest?.('.mes_text')) return;
+    const paragraph = node.closest?.('p, li, blockquote, div');
+    latestTextSelection = {
+        text: text.slice(0, 10000),
+        paragraphText: normalizeWhitespace(paragraph?.innerText || text).slice(0, 10000),
+        messageId: getMessageId(msg),
+        msg,
+    };
+    const button = ensureSelectionSpeakButton();
+    button.classList.add('visible');
+}
+
+function ensureSelectionSpeakButton() {
+    let button = document.getElementById('has-selection-speak');
+    if (button) return button;
+    button = document.createElement('button');
+    button.id = 'has-selection-speak';
+    button.type = 'button';
+    button.className = 'menu_button';
+    button.innerHTML = '<i class="fa-solid fa-volume-high"></i><span>朗读选中</span>';
+    button.addEventListener('click', () => playLightweightText(latestTextSelection.text, {
+        source: 'selection', sourceMessage: latestTextSelection.msg,
+    }));
+    document.body.appendChild(button);
+    return button;
+}
+
+async function buildRoutedAudioCacheIdentity(segment) {
+    if (segment.routeError) throw new Error(segment.routeError);
+    const profile = getSettings().providerProfiles?.[segment.profileId];
+    if (!profile) throw new Error(`找不到 TTS Profile: ${segment.profileId || '未配置'}`);
+    if (profile.type === 'edge') return buildEdgeAudioCacheIdentity(segment);
+    if (profile.type === 'openai-compatible') return buildIndexAudioCacheIdentity(segment);
+    if (profile.type === 'doubao') return buildDoubaoAudioCacheIdentity(segment);
+    throw new Error(`不支持的 TTS Provider: ${profile.type || 'unknown'}`);
+}
+
+function applyInlineCacheAvailability(key, hash, available, cacheChecked = true) {
+    const previous = inlineDialogueButtonStates.get(key) || { state: 'idle', cacheReady: false };
+    const keepLifecycleState = ['preparing', 'playing'].includes(previous.state);
+    setInlineDialogueButtonState(key, keepLifecycleState ? previous.state : (available ? 'ready' : 'idle'), {
+        cacheReady: available,
+        cacheHash: hash,
+        cacheChecked,
+    });
+}
+
+async function scanInlineDialogueCache(msg, analysis) {
+    const candidates = [];
+    for (let index = 0; index < analysis.dialogues.length; index += 1) {
+        const segment = analysis.dialogues[index];
+        if (segment.routeError || !segment.profileId || !segment.voiceId) continue;
+        try {
+            const { hash } = await buildRoutedAudioCacheIdentity(segment);
+            const key = getInlineDialogueButtonKey(msg, index);
+            const previous = inlineDialogueButtonStates.get(key);
+            if (previous?.cacheHash === hash && previous.cacheChecked) {
+                candidates.push({ key, hash, local: previous.cacheReady, checked: true });
+                continue;
+            }
+            const local = await hasLocalCachedAudio(hash).catch(error => {
+                console.warn(`[${extensionName}] inline local cache check failed`, error);
+                return false;
+            });
+            if (local) applyInlineCacheAvailability(key, hash, true);
+            else applyInlineCacheAvailability(key, hash, false, false);
+            candidates.push({ key, hash, local, checked: false });
+        } catch (error) {
+            console.warn(`[${extensionName}] inline cache identity failed`, error);
+        }
+    }
+
+    const misses = candidates.filter(item => !item.local && !item.checked);
+    let serverResult = {};
+    let serverError = null;
+    if (misses.length && getSettings().sharedAudioCacheEnabled !== false) {
+        try {
+            serverResult = await verifyServerCachedAudio(misses.map(item => item.hash));
+        } catch (error) {
+            serverError = error;
+            console.warn(`[${extensionName}] inline server cache check failed`, error);
+        }
+    }
+    misses.forEach(item => applyInlineCacheAvailability(
+        item.key,
+        item.hash,
+        serverResult[item.hash] === true,
+        !serverError,
+    ));
+
+    const readyCount = candidates.filter(item => {
+        const state = inlineDialogueButtonStates.get(item.key);
+        return state?.cacheHash === item.hash && state.cacheReady;
+    }).length;
+    Object.assign(getAudit().inline_cache_scan ||= {}, {
+        status: serverError ? 'fail' : 'success',
+        error: serverError ? String(serverError.message || serverError).slice(0, 200) : null,
+        checked_count: candidates.length,
+        ready_count: readyCount,
+        server_checked: misses.length > 0 && getSettings().sharedAudioCacheEnabled !== false,
+    });
+}
+
+function createInlineDialogueButton(msg, index, dialogue) {
     const button = document.createElement('button');
     button.type = 'button';
     button.className = 'has-inline-dialogue-button';
     button.dataset.dialogueIndex = String(index);
-    button.title = `播放/生成单句：${dialogue.character || '角色'}`;
-    button.innerHTML = '<i class="fa-solid fa-headphones-simple"></i>';
+    const dialogueKey = getInlineDialogueButtonKey(msg, index);
+    button.dataset.dialogueKey = dialogueKey;
+    const savedState = inlineDialogueButtonStates.get(dialogueKey) || { state: 'idle', cacheReady: false };
+    const presentation = getInlineDialogueButtonPresentation(savedState.state);
+    button.dataset.state = savedState.state;
+    button.title = presentation.label;
+    button.setAttribute('aria-label', presentation.label);
+    button.setAttribute('aria-busy', String(presentation.busy));
+    button.setAttribute('aria-pressed', String(presentation.pressed));
+    button.classList.toggle('has-busy', presentation.busy);
+    button.classList.toggle('has-playing', savedState.state === 'playing');
+    button.innerHTML = `<i class="${presentation.iconClass}" aria-hidden="true"></i>`;
     return button;
 }
 
@@ -2344,7 +3809,7 @@ function injectInlineDialogueButtons(msg) {
     fallback.className = 'has-inline-dialogue-fallback';
 
     analysis.dialogues.forEach((dialogue, index) => {
-        const button = createInlineDialogueButton(index, dialogue);
+        const button = createInlineDialogueButton(msg, index, dialogue);
         const inserted = insertButtonAfterText(root, dialogue.rawContent, button)
             || insertButtonAfterText(root, dialogue.originalLine, button)
             || insertButtonAfterText(root, dialogue.text, button);
@@ -2354,6 +3819,11 @@ function injectInlineDialogueButtons(msg) {
     if (fallback.childElementCount) {
         root.prepend(fallback);
     }
+    scanInlineDialogueCache(msg, analysis).catch(error => {
+        Object.assign(getAudit().inline_cache_scan ||= {}, {
+            status: 'fail', error: String(error.message || error).slice(0, 200),
+        });
+    });
 }
 
 function handleMessageButtonClick(event) {
@@ -2383,9 +3853,26 @@ function handleMessageButtonClick(event) {
     const lastHandledAt = Number(button.dataset.hasHandledAt || 0);
     if (now - lastHandledAt < 250) return;
     button.dataset.hasHandledAt = String(now);
+    button.closest('.has-msg-more')?.removeAttribute('open');
 
     if (button.classList.contains('has-play-msg')) {
         playAudiobookMessage(msg, button);
+        return;
+    }
+    if (button.classList.contains('has-play-selection')) {
+        if (!latestTextSelection.text || latestTextSelection.msg !== msg) {
+            toastWarn('请先在这条消息中选中文字');
+            return;
+        }
+        playLightweightText(latestTextSelection.text, { source: 'selection', sourceMessage: msg });
+        return;
+    }
+    if (button.classList.contains('has-play-paragraph')) {
+        const content = extractContentBlock(getRawMessageText(msg));
+        const paragraph = latestTextSelection.msg === msg && latestTextSelection.paragraphText
+            ? latestTextSelection.paragraphText
+            : normalizeWhitespace(content).split(/\n+/).find(Boolean);
+        playLightweightText(paragraph || '', { source: 'paragraph', sourceMessage: msg });
         return;
     }
     if (button.classList.contains('has-infer-msg')) {
@@ -2409,12 +3896,74 @@ function refreshMessageButtons() {
     });
 }
 
+function getPublicPlaybackState() {
+    const session = playbackSessions.getActive();
+    return session ? {
+        sessionId: session.id,
+        source: session.source,
+        status: session.status,
+        index: session.currentIndex,
+        total: session.segments.length,
+    } : { sessionId: null, source: null, status: 'idle', index: 0, total: 0 };
+}
+
+async function handleIntegrationSpeak(data = {}) {
+    Object.assign(getAudit().integration_event, { status: 'success', error: null, last_event: integrationEvents.speak });
+    if (String(data.text || '').trim()) {
+        return playLightweightText(data.text, {
+            source: 'external',
+            profileId: String(data.profileId || ''),
+            voiceId: String(data.voiceId || ''),
+            character: String(data.character || ''),
+        });
+    }
+    const messages = Array.from(document.querySelectorAll('.mes'));
+    const msg = data.messageId !== undefined && data.messageId !== null
+        ? messages.find(item => String(getMessageId(item)) === String(data.messageId))
+        : messages.reverse().find(item => item.getAttribute('is_user') !== 'true');
+    if (!msg) {
+        emitPlaybackState({ id: String(data.requestId || 'external'), currentIndex: 0, segments: [] }, 'error', 'message_not_found');
+        return false;
+    }
+    const settings = getSettings();
+    const preset = getActivePreset(settings);
+    const previousMode = preset?.mode;
+    if (preset && ['mixed', 'dialogue-only', 'single-voice'].includes(data.mode)) preset.mode = data.mode;
+    const promise = playAudiobookMessage(msg, null, { playbackUiOverride: data.openStage === true ? 'video' : 'player' });
+    if (preset && previousMode) preset.mode = previousMode;
+    return promise;
+}
+
+function setupIntegrationEvents() {
+    const previous = window.__hybridAudiobookStageIntegrationHandlers;
+    if (previous) {
+        eventSource?.removeListener?.(integrationEvents.speak, previous.speak);
+        eventSource?.removeListener?.(integrationEvents.stop, previous.stop);
+    }
+    const handlers = {
+        speak: data => handleIntegrationSpeak(data).catch(error => {
+            Object.assign(getAudit().integration_event, { status: 'fail', error: error.message, last_event: integrationEvents.speak });
+        }),
+        stop: () => {
+            Object.assign(getAudit().integration_event, { status: 'success', error: null, last_event: integrationEvents.stop });
+            stopCurrentPlayback();
+        },
+    };
+    eventSource?.on?.(integrationEvents.speak, handlers.speak);
+    eventSource?.on?.(integrationEvents.stop, handlers.stop);
+    window.__hybridAudiobookStageIntegrationHandlers = handlers;
+}
+
 function init() {
     console.warn('[混合有声书舞台] root entry loaded');
     getSettings();
     ensureSettingsPanel();
     ensureLauncher();
     refreshMessageButtons();
+    ensureSelectionSpeakButton();
+    setupIntegrationEvents();
+    document.removeEventListener('selectionchange', captureLatestTextSelection);
+    document.addEventListener('selectionchange', captureLatestTextSelection);
     document.removeEventListener('click', handleMessageButtonClick, true);
     document.addEventListener('click', handleMessageButtonClick, true);
     window.removeEventListener('pointerdown', handleMessageButtonClick, true);
@@ -2432,7 +3981,15 @@ function init() {
         event_types.MESSAGE_SWIPED,
         event_types.CHAT_CHANGED,
     ].filter(Boolean).forEach(eventType => {
-        eventSource?.on?.(eventType, () => setTimeout(refreshMessageButtons, 50));
+        eventSource?.on?.(eventType, () => {
+            if ([event_types.MESSAGE_EDITED, event_types.MESSAGE_SWIPED, event_types.CHAT_CHANGED].includes(eventType)) {
+                stopCurrentPlayback();
+                inlineDialogueButtonStates.clear();
+                latestTextSelection = { text: '', paragraphText: '', messageId: '', msg: null };
+                document.getElementById('has-selection-speak')?.classList.remove('visible');
+            }
+            setTimeout(refreshMessageButtons, 50);
+        });
     });
     setInterval(refreshMessageButtons, 3000);
 
@@ -2446,7 +4003,11 @@ function init() {
         extractContentBlock,
         splitIntoSegments,
         collectSegmentsFromText,
+        speak: handleIntegrationSpeak,
+        stop: stopCurrentPlayback,
+        getPlaybackState: getPublicPlaybackState,
     };
+    Object.assign(getAudit().stage_linked, { status: 'success', error: null, uses_shared_session: true });
 }
 
 init();

@@ -6,6 +6,7 @@ node_modules/
 *.log
 *.tmp
 *.bak
+.memory/
 
 # Local/generated audio and video samples
 *.wav

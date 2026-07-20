@@ -4,15 +4,31 @@ const path = require('path');
 const crypto = require('crypto');
 const os = require('os');
 const { spawn } = require('child_process');
+const { buildDoubaoUpstreamRequest, parseDoubaoNdjson } = require('./doubao-tts');
 
 const MODULE_NAME = '[HybridAudiobookStage-Launcher]';
 const INDEX_TTS_ROOT = process.env.HYBRID_AUDIOBOOK_INDEX_TTS_ROOT || path.join(process.cwd(), 'IndexTTS2');
 const DEFAULT_BAT = process.env.HYBRID_AUDIOBOOK_INDEX_TTS_BAT || path.join(INDEX_TTS_ROOT, '启动api服务.bat');
 const CACHE_SUBDIR = path.join('HybridAudiobookStage', 'audio');
 const MAX_UPLOAD_BYTES = 80 * 1024 * 1024;
+const MAX_TTS_RESPONSE_BYTES = 80 * 1024 * 1024;
+const TTS_PROXY_TIMEOUT_MS = 60000;
 const DEFAULT_MAX_CACHE_BYTES = 2 * 1024 * 1024 * 1024;
 const DEFAULT_INDEX_TTS_API = 'http://127.0.0.1:7880/v1/audio/speech';
 const DEFAULT_INDEX_TTS_MODELS = 'http://127.0.0.1:7880/v1/models';
+const DEFAULT_INDEX_TTS_VOICE_DIR = process.env.HYBRID_AUDIOBOOK_INDEX_TTS_VOICE_DIR
+    || path.join(INDEX_TTS_ROOT, 'api', 'ckyp');
+
+function listIndexTtsVoiceFiles() {
+    const directory = path.resolve(DEFAULT_INDEX_TTS_VOICE_DIR);
+    if (!fs.existsSync(directory) || !fs.statSync(directory).isDirectory()) {
+        throw new Error('找不到 IndexTTS2 音色目录');
+    }
+    return fs.readdirSync(directory, { withFileTypes: true })
+        .filter(entry => entry.isFile() && path.extname(entry.name).toLowerCase() === '.wav')
+        .map(entry => entry.name)
+        .sort((left, right) => left.localeCompare(right, undefined, { numeric: true, sensitivity: 'base' }));
+}
 
 function quotePowerShell(value) {
     return `'${String(value).replace(/'/g, "''")}'`;
@@ -192,6 +208,31 @@ function normalizeLocalIndexTtsUrl(value, fallback) {
     return url.toString();
 }
 
+function normalizeTtsProxyUrl(value) {
+    const url = new URL(String(value || '').trim());
+    if (!['http:', 'https:'].includes(url.protocol)) throw new Error('TTS proxy only allows http/https endpoints');
+    if (url.username || url.password) throw new Error('TTS proxy endpoint must not contain credentials');
+    return url.toString();
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = TTS_PROXY_TIMEOUT_MS) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        return await fetch(url, { ...options, signal: controller.signal });
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+async function readLimitedResponse(upstream) {
+    const declaredLength = Number(upstream.headers.get('content-length') || 0);
+    if (declaredLength > MAX_TTS_RESPONSE_BYTES) throw new Error('TTS response is too large');
+    const buffer = Buffer.from(await upstream.arrayBuffer());
+    if (buffer.length > MAX_TTS_RESPONSE_BYTES) throw new Error('TTS response is too large');
+    return buffer;
+}
+
 async function init(router) {
     router.use(bodyParser.json({ limit: '120mb' }));
 
@@ -248,6 +289,16 @@ async function init(router) {
         }
     });
 
+    router.get('/index-tts2/voices', (req, res) => {
+        try {
+            const voices = listIndexTtsVoiceFiles();
+            return res.json({ ok: true, voices, count: voices.length });
+        } catch (error) {
+            console.error(MODULE_NAME, error);
+            return res.status(404).json({ ok: false, error: error.message || 'IndexTTS2 voice directory unavailable' });
+        }
+    });
+
     router.post('/index-tts2/proxy', async (req, res) => {
         try {
             const url = normalizeLocalIndexTtsUrl(req.body?.apiUrl, DEFAULT_INDEX_TTS_API);
@@ -267,6 +318,82 @@ async function init(router) {
         } catch (error) {
             console.error(MODULE_NAME, error);
             return res.status(502).send(error.message || 'IndexTTS2 proxy failed');
+        }
+    });
+
+    router.post('/tts/probe', async (req, res) => {
+        try {
+            const endpoint = normalizeTtsProxyUrl(req.body?.endpoint);
+            const headers = {};
+            if (req.body?.apiKey) headers.Authorization = `Bearer ${String(req.body.apiKey)}`;
+            const upstream = await fetchWithTimeout(endpoint, { method: 'GET', headers }, 15000);
+            return res.json({ ok: true, reachable: true, status: upstream.status });
+        } catch (error) {
+            return res.status(502).send(error?.name === 'AbortError' ? 'TTS probe timed out' : (error.message || 'TTS probe failed'));
+        }
+    });
+
+    router.post('/tts/proxy', async (req, res) => {
+        try {
+            const endpoint = normalizeTtsProxyUrl(req.body?.endpoint);
+            const payload = req.body?.payload;
+            if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+                return res.status(400).send('No TTS payload specified');
+            }
+            const headers = { 'Content-Type': 'application/json', Accept: 'audio/*,application/octet-stream' };
+            if (req.body?.apiKey) headers.Authorization = `Bearer ${String(req.body.apiKey)}`;
+            const upstream = await fetchWithTimeout(endpoint, {
+                method: 'POST',
+                headers,
+                body: JSON.stringify(payload),
+            });
+            const buffer = await readLimitedResponse(upstream);
+            res.status(upstream.status);
+            res.setHeader('Content-Type', upstream.headers.get('content-type') || 'audio/wav');
+            if (!upstream.ok) return res.send(buffer.toString('utf8'));
+            return res.send(buffer);
+        } catch (error) {
+            const message = error?.name === 'AbortError' ? 'TTS proxy timed out' : (error.message || 'TTS proxy failed');
+            return res.status(502).send(message);
+        }
+    });
+
+    router.post('/doubao-tts/generate', async (req, res) => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), TTS_PROXY_TIMEOUT_MS);
+        const abortForClient = () => controller.abort();
+        const abortForClosedResponse = () => {
+            if (!res.writableEnded) controller.abort();
+        };
+        req.once('aborted', abortForClient);
+        res.once('close', abortForClosedResponse);
+        try {
+            const request = buildDoubaoUpstreamRequest(req.body);
+            const upstream = await fetch(request.url, {
+                method: 'POST',
+                headers: request.headers,
+                body: JSON.stringify(request.payload),
+                signal: controller.signal,
+            });
+            const upstreamBuffer = await readLimitedResponse(upstream);
+            if (!upstream.ok) {
+                const message = upstreamBuffer.toString('utf8').slice(0, 500);
+                return res.status(upstream.status).send(message || `豆包 TTS HTTP ${upstream.status}`);
+            }
+            const audio = parseDoubaoNdjson(upstreamBuffer.toString('utf8'), MAX_TTS_RESPONSE_BYTES);
+            res.setHeader('Content-Type', 'audio/mpeg');
+            res.setHeader('Cache-Control', 'no-store');
+            return res.send(audio);
+        } catch (error) {
+            const message = error?.name === 'AbortError'
+                ? '豆包 TTS 请求超时'
+                : (error.message || '豆包 TTS 请求失败');
+            const status = /缺少|过长/.test(message) ? 400 : 502;
+            return res.status(status).send(message);
+        } finally {
+            clearTimeout(timer);
+            req.removeListener('aborted', abortForClient);
+            res.removeListener('close', abortForClosedResponse);
         }
     });
 
@@ -438,7 +565,7 @@ async function exit() {
 const info = {
     id: 'hybrid-audiobook-stage',
     name: 'HybridAudiobookStage Launcher',
-    description: 'Starts local IndexTTS2 API for the HybridAudiobookStage extension.',
+    description: 'Provides TTS proxies and shared audio cache for the HybridAudiobookStage extension.',
 };
 
 module.exports = {

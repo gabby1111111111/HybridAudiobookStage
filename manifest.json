@@ -6,6 +6,6 @@
   "js": "index.js",
   "css": "style.css",
   "author": "Gabby + Codex",
-  "version": "0.1.0",
-  "description": "支持纯有声书和视频字幕的 <content> 朗读舞台。"
+  "version": "0.2.0",
+  "description": "支持多 Provider、朗读预设、选中文字及视频字幕舞台的轻量 <content> TTS。"
 }
