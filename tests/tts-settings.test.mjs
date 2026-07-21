@@ -6,7 +6,9 @@ import {
     LEGACY_EDGE_PROFILE_ID,
     LEGACY_OPENAI_PROFILE_ID,
     LEGACY_PRESET_ID,
+    MINIMAX_NATIVE_PROFILE_ID,
     TTS_SETTINGS_VERSION,
+    XIAOMI_MIMO_PROFILE_ID,
 } from '../public/lib/tts-settings.mjs';
 
 test('migrates empty settings without deleting legacy-compatible fields', () => {
@@ -20,9 +22,14 @@ test('migrates empty settings without deleting legacy-compatible fields', () => 
     assert.equal(settings.providerProfiles[LEGACY_EDGE_PROFILE_ID].type, 'edge');
     assert.equal(settings.providerProfiles[DOUBAO_NATIVE_PROFILE_ID].type, 'doubao');
     assert.equal(settings.providerProfiles[DOUBAO_NATIVE_PROFILE_ID].resourceId, 'seed-tts-2.0');
+    assert.equal(settings.providerProfiles[MINIMAX_NATIVE_PROFILE_ID].type, 'minimax');
+    assert.deepEqual(settings.providerProfiles[MINIMAX_NATIVE_PROFILE_ID].discoveredVoices, []);
+    assert.equal(settings.providerProfiles[XIAOMI_MIMO_PROFILE_ID].type, 'xiaomi-mimo');
+    assert.equal(settings.providerProfiles[XIAOMI_MIMO_PROFILE_ID].endpoint, 'https://api.xiaomimimo.com/v1');
     assert.equal(settings.routingPresets[LEGACY_PRESET_ID].mode, 'mixed');
     assert.equal(settings.playbackRate, 1);
     assert.equal(settings.synthesisSpeed, 1);
+    assert.equal(settings.dialoguePlaybackRate, 1);
 });
 
 test('migrates legacy provider, speed, narration and character settings', () => {
@@ -48,6 +55,7 @@ test('migrates legacy provider, speed, narration and character settings', () => 
     assert.equal(openAi.requestMode, 'direct');
     assert.equal(settings.playbackRate, 1.4);
     assert.equal(settings.synthesisSpeed, 1);
+    assert.equal(settings.dialoguePlaybackRate, 1);
     assert.equal(preset.mode, 'dialogue-only');
     assert.deepEqual(preset.characterOverrides.Alice, {
         profileId: LEGACY_OPENAI_PROFILE_ID,
@@ -80,6 +88,7 @@ test('preserves custom v2 profiles and presets', () => {
     assert.equal(settings.activeRoutingPresetId, 'customPreset');
     assert.equal(settings.playbackRate, 0.9);
     assert.equal(settings.synthesisSpeed, 1.1);
+    assert.equal(settings.dialoguePlaybackRate, 1.1);
 });
 
 test('is idempotent after the first migration', () => {

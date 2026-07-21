@@ -1,8 +1,10 @@
-export const TTS_SETTINGS_VERSION = 3;
+export const TTS_SETTINGS_VERSION = 5;
 
 export const LEGACY_OPENAI_PROFILE_ID = 'profile-openai-legacy';
 export const LEGACY_EDGE_PROFILE_ID = 'profile-edge-legacy';
 export const DOUBAO_NATIVE_PROFILE_ID = 'profile-doubao-native';
+export const MINIMAX_NATIVE_PROFILE_ID = 'profile-minimax-native';
+export const XIAOMI_MIMO_PROFILE_ID = 'profile-xiaomi-mimo-native';
 export const LEGACY_PRESET_ID = 'preset-default-legacy';
 
 function isRecord(value) {
@@ -67,6 +69,39 @@ function buildDoubaoNativeProfile() {
     };
 }
 
+function buildMinimaxNativeProfile() {
+    return {
+        id: MINIMAX_NATIVE_PROFILE_ID,
+        name: 'MiniMax 原生',
+        type: 'minimax',
+        enabled: true,
+        apiKey: '',
+        platform: 'cn',
+        model: 'speech-2.8-hd',
+        defaultVoice: 'Chinese (Mandarin)_Warm_Bestie',
+        responseFormat: 'mp3',
+        style: '',
+        discoveredVoices: [],
+        requestMode: 'server-proxy',
+    };
+}
+
+function buildXiaomiMimoProfile() {
+    return {
+        id: XIAOMI_MIMO_PROFILE_ID,
+        name: '小米 MiMo 原生',
+        type: 'xiaomi-mimo',
+        enabled: true,
+        apiKey: '',
+        endpoint: 'https://api.xiaomimimo.com/v1',
+        model: 'mimo-v2.5-tts',
+        defaultVoice: 'mimo_default',
+        responseFormat: 'wav',
+        style: '',
+        requestMode: 'server-proxy',
+    };
+}
+
 function buildLegacyPreset(settings) {
     const dialogueVoice = String(settings.defaultVoice || 'default.wav');
     const edgeVoice = String(settings.edgeVoice || 'zh-CN-XiaoxiaoNeural');
@@ -126,6 +161,17 @@ export function ensureTtsSettingsV2(settings) {
         providerProfiles[DOUBAO_NATIVE_PROFILE_ID] = buildDoubaoNativeProfile();
         changed = true;
     }
+    if (!isRecord(providerProfiles[MINIMAX_NATIVE_PROFILE_ID])) {
+        providerProfiles[MINIMAX_NATIVE_PROFILE_ID] = buildMinimaxNativeProfile();
+        changed = true;
+    } else if (!Array.isArray(providerProfiles[MINIMAX_NATIVE_PROFILE_ID].discoveredVoices)) {
+        providerProfiles[MINIMAX_NATIVE_PROFILE_ID].discoveredVoices = [];
+        changed = true;
+    }
+    if (!isRecord(providerProfiles[XIAOMI_MIMO_PROFILE_ID])) {
+        providerProfiles[XIAOMI_MIMO_PROFILE_ID] = buildXiaomiMimoProfile();
+        changed = true;
+    }
     if (!isRecord(routingPresets[LEGACY_PRESET_ID])) {
         routingPresets[LEGACY_PRESET_ID] = buildLegacyPreset(settings);
         changed = true;
@@ -144,6 +190,12 @@ export function ensureTtsSettingsV2(settings) {
     }
     if (!Number.isFinite(Number(settings.synthesisSpeed))) {
         settings.synthesisSpeed = 1;
+        changed = true;
+    }
+    if (!Number.isFinite(Number(settings.dialoguePlaybackRate))) {
+        settings.dialoguePlaybackRate = Number.isFinite(Number(settings.synthesisSpeed))
+            ? Number(settings.synthesisSpeed)
+            : 1;
         changed = true;
     }
     if (!Number.isFinite(Number(settings.prefetchCount))) {

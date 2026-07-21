@@ -29,7 +29,10 @@ export function createTtsAuditState(now = Date.now()) {
         prefetch: { status: 'pending', error: null, max_ahead: 0 },
         inline_button: { status: 'pending', error: null, state: 'idle', cache_ready: false },
         inline_cache_scan: { status: 'pending', error: null, checked_count: 0, ready_count: 0, server_checked: false },
-        player_ready: { status: 'pending', error: null, ui_mode: null, controls_ready: false, playback_rate: 1 },
+        player_ready: {
+            status: 'pending', error: null, ui_mode: null, controls_ready: false, playback_rate: 1,
+            current_audio_rate: 0, visible: false, in_viewport: false,
+        },
         integration_event: { status: 'pending', error: null, last_event: null },
         stage_linked: { status: 'pending', error: null, uses_shared_session: false },
         lightweight_ui: { status: 'pending', error: null, default_sections: 0, advanced_collapsed: false, legacy_collapsed: false },

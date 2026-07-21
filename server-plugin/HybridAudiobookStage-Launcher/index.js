@@ -5,6 +5,14 @@ const crypto = require('crypto');
 const os = require('os');
 const { spawn } = require('child_process');
 const { buildDoubaoUpstreamRequest, parseDoubaoNdjson } = require('./doubao-tts');
+const {
+    buildMinimaxRequest,
+    parseMinimaxResponse,
+    buildMinimaxVoiceListRequest,
+    parseMinimaxVoiceListResponse,
+    buildXiaomiMimoRequest,
+    parseXiaomiMimoResponse,
+} = require('./cloud-tts');
 
 const MODULE_NAME = '[HybridAudiobookStage-Launcher]';
 const INDEX_TTS_ROOT = process.env.HYBRID_AUDIOBOOK_INDEX_TTS_ROOT || path.join(process.cwd(), 'IndexTTS2');
@@ -390,6 +398,84 @@ async function init(router) {
                 : (error.message || '豆包 TTS 请求失败');
             const status = /缺少|过长/.test(message) ? 400 : 502;
             return res.status(status).send(message);
+        } finally {
+            clearTimeout(timer);
+            req.removeListener('aborted', abortForClient);
+            res.removeListener('close', abortForClosedResponse);
+        }
+    });
+
+    const registerCloudTtsRoute = (route, label, buildRequest, parseResponse) => {
+        router.post(route, async (req, res) => {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), TTS_PROXY_TIMEOUT_MS);
+            const abortForClient = () => controller.abort();
+            const abortForClosedResponse = () => {
+                if (!res.writableEnded) controller.abort();
+            };
+            req.once('aborted', abortForClient);
+            res.once('close', abortForClosedResponse);
+            try {
+                const request = buildRequest(req.body);
+                const upstream = await fetch(request.url, {
+                    method: 'POST',
+                    headers: request.headers,
+                    body: JSON.stringify(request.payload),
+                    signal: controller.signal,
+                });
+                const upstreamBuffer = await readLimitedResponse(upstream);
+                if (!upstream.ok) {
+                    return res.status(upstream.status).send(`${label} HTTP ${upstream.status}`);
+                }
+                const audio = parseResponse(upstreamBuffer, MAX_TTS_RESPONSE_BYTES);
+                res.setHeader('Content-Type', request.format === 'mp3' ? 'audio/mpeg' : 'audio/wav');
+                res.setHeader('Cache-Control', 'no-store');
+                return res.send(audio);
+            } catch (error) {
+                const message = error?.name === 'AbortError'
+                    ? `${label} 请求超时`
+                    : (error.message || `${label} 请求失败`);
+                const status = /缺少|过长|必须|不支持/.test(message) ? 400 : 502;
+                return res.status(status).send(message.slice(0, 300));
+            } finally {
+                clearTimeout(timer);
+                req.removeListener('aborted', abortForClient);
+                res.removeListener('close', abortForClosedResponse);
+            }
+        });
+    };
+
+    registerCloudTtsRoute('/minimax-tts/generate', 'MiniMax TTS', buildMinimaxRequest, parseMinimaxResponse);
+    registerCloudTtsRoute('/xiaomi-mimo-tts/generate', '小米 MiMo TTS', buildXiaomiMimoRequest, parseXiaomiMimoResponse);
+
+    router.post('/minimax-tts/voices', async (req, res) => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), TTS_PROXY_TIMEOUT_MS);
+        const abortForClient = () => controller.abort();
+        const abortForClosedResponse = () => {
+            if (!res.writableEnded) controller.abort();
+        };
+        req.once('aborted', abortForClient);
+        res.once('close', abortForClosedResponse);
+        try {
+            const request = buildMinimaxVoiceListRequest(req.body);
+            const upstream = await fetch(request.url, {
+                method: 'POST',
+                headers: request.headers,
+                body: JSON.stringify(request.payload),
+                signal: controller.signal,
+            });
+            const upstreamBuffer = await readLimitedResponse(upstream);
+            if (!upstream.ok) return res.status(upstream.status).send(`MiniMax 音色列表 HTTP ${upstream.status}`);
+            const voices = parseMinimaxVoiceListResponse(upstreamBuffer);
+            res.setHeader('Cache-Control', 'no-store');
+            return res.json({ ok: true, voices });
+        } catch (error) {
+            const message = error?.name === 'AbortError'
+                ? 'MiniMax 音色列表请求超时'
+                : (error.message || 'MiniMax 音色列表请求失败');
+            const status = /缺少|过长|必须/.test(message) ? 400 : 502;
+            return res.status(status).send(message.slice(0, 300));
         } finally {
             clearTimeout(timer);
             req.removeListener('aborted', abortForClient);

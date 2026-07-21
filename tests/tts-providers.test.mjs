@@ -1,6 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildDoubaoProxyPayload, buildOpenAiSpeechPayload, createProviderRegistry } from '../public/lib/tts-providers.mjs';
+import {
+    buildDoubaoProxyPayload,
+    buildMinimaxProxyPayload,
+    buildOpenAiSpeechPayload,
+    buildXiaomiMimoProxyPayload,
+    createProviderRegistry,
+} from '../public/lib/tts-providers.mjs';
 
 const profile = {
     id: 'index-local',
@@ -108,6 +114,34 @@ test('routes native Doubao synthesis through the fixed local proxy', async () =>
     assert.equal(JSON.parse(call.options.body).accessKey, 'access-secret');
     assert.equal(result.providerId, 'doubao');
     assert.equal(JSON.stringify(result.cacheDescriptor).includes('access-secret'), false);
+});
+
+test('routes MiniMax and Xiaomi MiMo through fixed local proxies without credential cache leakage', async () => {
+    const calls = [];
+    const registry = createProviderRegistry({
+        fetchImpl: async (url, options) => {
+            calls.push({ url, body: JSON.parse(options.body) });
+            return new Response(new Blob(['audio'], { type: 'audio/mpeg' }), { status: 200 });
+        },
+    });
+    const minimax = {
+        id: 'minimax', type: 'minimax', enabled: true, apiKey: 'mini-secret', platform: 'cn',
+        model: 'speech-2.8-hd', defaultVoice: 'warm', responseFormat: 'mp3', style: 'happy',
+    };
+    const mimo = {
+        id: 'mimo', type: 'xiaomi-mimo', enabled: true, apiKey: 'mimo-secret',
+        model: 'mimo-v2.5-tts', defaultVoice: 'mimo_default', responseFormat: 'wav', style: '温柔',
+    };
+    assert.equal(buildMinimaxProxyPayload(minimax, { text: '你好' }).platform, 'cn');
+    assert.equal(buildXiaomiMimoProxyPayload(mimo, { text: '你好' }).model, 'mimo-v2.5-tts');
+    const miniResult = await registry.synthesize(minimax, { text: '你好' });
+    const mimoResult = await registry.synthesize(mimo, { text: '世界' });
+    assert.equal(calls[0].url, '/api/plugins/hybrid-audiobook-stage/minimax-tts/generate');
+    assert.equal(calls[1].url, '/api/plugins/hybrid-audiobook-stage/xiaomi-mimo-tts/generate');
+    assert.equal(miniResult.providerId, 'minimax');
+    assert.equal(mimoResult.providerId, 'xiaomi-mimo');
+    assert.equal(JSON.stringify(miniResult.cacheDescriptor).includes('mini-secret'), false);
+    assert.equal(JSON.stringify(mimoResult.cacheDescriptor).includes('mimo-secret'), false);
 });
 
 test('propagates abort and HTTP errors', async () => {

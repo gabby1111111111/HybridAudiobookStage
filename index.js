@@ -13,6 +13,8 @@ import {
     ensureTtsSettingsV2,
     LEGACY_EDGE_PROFILE_ID,
     LEGACY_OPENAI_PROFILE_ID,
+    MINIMAX_NATIVE_PROFILE_ID,
+    XIAOMI_MIMO_PROFILE_ID,
 } from './public/lib/tts-settings.mjs';
 import {
     collectTextSegments,
@@ -49,6 +51,13 @@ import {
     getEdgeCatalogVoice,
     getPrioritizedEdgeVoiceGroups,
 } from './public/lib/edge-voice-catalog.mjs';
+import {
+    CUSTOM_CLOUD_MODEL_OPTION,
+    XIAOMI_MIMO_VOICES,
+    getCloudModelOptions,
+    getXiaomiMimoVoice,
+    normalizeDiscoveredMinimaxVoices,
+} from './public/lib/cloud-voice-catalog.mjs';
 
 const extensionName = 'HybridAudiobookStage';
 const integrationEvents = {
@@ -129,6 +138,7 @@ let currentPlayback = {
 
 let latestTextSelection = { text: '', paragraphText: '', messageId: '', msg: null };
 const inlineDialogueButtonStates = new Map();
+let inlineDialogueCacheGeneration = 0;
 
 function getInlineDialogueButtonKey(msg, dialogueIndex) {
     return `${getMessageId(msg)}:${Number(dialogueIndex) || 0}`;
@@ -720,6 +730,28 @@ function formatTime(seconds) {
     return `${mins}:${String(secs).padStart(2, '0')}`;
 }
 
+function isDialoguePlaybackSegment(segment) {
+    if (segment?.type === 'dialogue') return true;
+    if (segment?.type === 'narration') return false;
+    const character = String(segment?.character || '').trim();
+    return !!character && !/^Narrator$|^旁白$/i.test(character);
+}
+
+function getPlaybackRate(segment = currentPlayback.playlist?.[currentPlayback.index]) {
+    const settings = getSettings();
+    const value = isDialoguePlaybackSegment(segment)
+        ? settings.dialoguePlaybackRate
+        : settings.playbackRate;
+    return Math.max(0.5, Math.min(3, Number(value || 1)));
+}
+
+function applyPlaybackSettings(audio, segment = currentPlayback.playlist?.[currentPlayback.index]) {
+    if (!audio) return;
+    const settings = getSettings();
+    audio.volume = Math.max(0, Math.min(1, Number(settings.volume ?? 1)));
+    audio.playbackRate = getPlaybackRate(segment);
+}
+
 function setStageProgress(current = 0, duration = 0) {
     const safeCurrent = Math.max(0, Number(current) || 0);
     const safeDuration = Math.max(0, Number(duration) || 0);
@@ -773,11 +805,14 @@ function ensureAudioPlayer() {
     root.querySelector('#has-player-progress').addEventListener('input', event => currentPlayback.controller?.seek?.(Number(event.target.value) / 1000));
     root.querySelector('#has-player-speed').addEventListener('click', () => {
         const cycle = [0.5, 1, 1.25, 1.5, 2, 3];
-        const current = Number(getSettings().playbackRate || 1);
+        const settings = getSettings();
+        const segment = currentPlayback.playlist?.[currentPlayback.index];
+        const settingsKey = isDialoguePlaybackSegment(segment) ? 'dialoguePlaybackRate' : 'playbackRate';
+        const current = Number(settings[settingsKey] || 1);
         const next = cycle.find(value => value > current + 0.01) || cycle[0];
-        getSettings().playbackRate = next;
+        settings[settingsKey] = next;
         saveSettings();
-        if (currentPlayback.audio) currentPlayback.audio.playbackRate = next;
+        applyPlaybackSettings(currentPlayback.audio, segment);
         renderAudioPlayer();
         syncSettingsPanel();
     });
@@ -835,7 +870,11 @@ function renderAudioPlayer() {
     const duration = Number(activeAudio?.duration || currentPlayback.playlist?.[currentPlayback.index]?.duration || 0);
     if (timeCurrent) timeCurrent.textContent = formatTime(current);
     if (timeLeft) timeLeft.textContent = `-${formatTime(Math.max(0, duration - current))}`;
-    if (speed) speed.textContent = `${Number(getSettings().playbackRate || 1).toFixed(1)}x`;
+    const activeSegment = currentPlayback.playlist?.[currentPlayback.index];
+    if (speed) {
+        speed.textContent = `${getPlaybackRate(activeSegment).toFixed(1)}x`;
+        speed.title = isDialoguePlaybackSegment(activeSegment) ? '角色台词语速' : '旁白语速';
+    }
     if (volume) {
         const vol = Number(getSettings().volume || 0);
         volume.className = vol === 0 ? 'fa-solid fa-volume-xmark' : (vol < 0.5 ? 'fa-solid fa-volume-low' : 'fa-solid fa-volume-high');
@@ -849,9 +888,16 @@ function renderAudioPlayer() {
                 : stageState.playing ? '正在播放' : (session?.status === 'completed' ? '播放完成' : '已暂停');
         status.textContent = pendingCount ? `${label} · 预取 ${pendingCount}` : label;
     }
+    const rect = root.getBoundingClientRect();
+    const viewportWidth = window.visualViewport?.width || window.innerWidth;
+    const viewportHeight = window.visualViewport?.height || window.innerHeight;
+    const playerVisible = root.classList.contains('visible');
     Object.assign(getAudit().player_ready, {
         status: 'success', error: null, ui_mode: stageState.uiMode || 'player', controls_ready: true,
-        playback_rate: Number(getSettings().playbackRate || 1),
+        playback_rate: getPlaybackRate(activeSegment), current_audio_rate: Number(activeAudio?.playbackRate || 0),
+        segment_type: isDialoguePlaybackSegment(activeSegment) ? 'dialogue' : 'narration',
+        visible: playerVisible,
+        in_viewport: playerVisible && rect.right > 0 && rect.bottom > 0 && rect.left < viewportWidth && rect.top < viewportHeight,
     });
 }
 
@@ -1187,7 +1233,7 @@ async function buildIndexAudioCacheIdentity(segment) {
     if (!profile) throw new Error('没有可用的 OpenAI 兼容 TTS Profile');
     const rawVoice = String(segment.voiceId || segment.voice || preset.dialogueDefault?.voiceId || profile.defaultVoice || settings.defaultVoice || '').trim();
     const voice = profile.id === LEGACY_OPENAI_PROFILE_ID ? ensureWavSuffix(rawVoice) : rawVoice;
-    const speed = Number(settings.synthesisSpeed || 1) || 1;
+    const speed = 1;
     const cacheDescriptor = buildSynthesisDescriptor({
         providerType: profile.type,
         profileId: profile.id,
@@ -1382,6 +1428,67 @@ async function ensureDoubaoAudio(segment, { signal } = {}) {
     return materializeAudioRecord(record, 'generated');
 }
 
+async function buildCloudAudioCacheIdentity(segment, providerType, fallbackProfileId) {
+    const profile = getProviderProfile(segment.profileId, providerType, fallbackProfileId);
+    if (!profile) throw new Error(`没有可用的 ${providerType} TTS Profile`);
+    const text = String(segment.text || '').trim();
+    const voice = String(segment.voiceId || profile.defaultVoice || '').trim();
+    if (!text) throw new Error('TTS 文本为空');
+    if (!voice) throw new Error(`${profile.name || providerType} 缺少音色`);
+    const model = String(profile.model || '').trim();
+    const format = String(profile.responseFormat || (providerType === 'minimax' ? 'mp3' : 'wav')).trim();
+    const style = [String(profile.style || '').trim(), String(segment.emotionLabel || '').trim()]
+        .filter(Boolean).join('；');
+    const platform = providerType === 'minimax' ? String(profile.platform || 'cn').trim() : '';
+    const cacheDescriptor = buildSynthesisDescriptor({
+        providerType,
+        profileId: profile.id,
+        model,
+        text,
+        voiceId: voice,
+        responseFormat: format,
+        extraBody: { platform, style },
+    });
+    const hash = await sha256(stableSerialize(cacheDescriptor));
+    const baseMeta = {
+        engine: providerType,
+        profileId: profile.id,
+        type: segment.type || 'dialogue',
+        text,
+        character: segment.character || '',
+        voice,
+        model,
+        format,
+        platform,
+        style,
+        timestamp: Date.now(),
+    };
+    return { profile, text, voice, model, format, platform, style, hash, baseMeta };
+}
+
+async function ensureCloudAudio(segment, providerType, fallbackProfileId, { signal } = {}) {
+    const identity = await buildCloudAudioCacheIdentity(segment, providerType, fallbackProfileId);
+    const cached = await findCachedAudio(identity.hash, identity.baseMeta, signal);
+    if (cached?.blob) return cached;
+    const synthesis = await providerRegistry.synthesize(identity.profile, {
+        text: identity.text,
+        voiceId: identity.voice,
+        style: identity.style,
+        emotion: identity.style,
+        signal,
+    });
+    Object.assign(getAudit().provider_ready, {
+        status: 'success', error: null, profile_id: identity.profile.id,
+        provider_type: providerType, probe_ok: true,
+    });
+    const record = { hash: identity.hash, ...identity.baseMeta, blob: synthesis.blob, timestamp: Date.now() };
+    await saveCachedAudio(record);
+    record.localPersisted = true;
+    pruneLocalAudioCache().catch(error => console.warn(`[${extensionName}] cache prune failed`, error));
+    uploadServerCachedAudio(record).catch(error => console.warn(`[${extensionName}] shared cloud cache save failed`, error));
+    return materializeAudioRecord(record, 'generated');
+}
+
 async function ensureRoutedAudio(segment, options = {}) {
     if (segment.routeError) throw new Error(segment.routeError);
     const profile = getSettings().providerProfiles?.[segment.profileId];
@@ -1389,6 +1496,8 @@ async function ensureRoutedAudio(segment, options = {}) {
     if (profile.type === 'edge') return ensureEdgeAudio(segment, options);
     if (profile.type === 'openai-compatible') return ensureIndexAudio(segment, options);
     if (profile.type === 'doubao') return ensureDoubaoAudio(segment, options);
+    if (profile.type === 'minimax') return ensureCloudAudio(segment, 'minimax', MINIMAX_NATIVE_PROFILE_ID, options);
+    if (profile.type === 'xiaomi-mimo') return ensureCloudAudio(segment, 'xiaomi-mimo', XIAOMI_MIMO_PROFILE_ID, options);
     throw new Error(`不支持的 TTS Provider: ${profile.type || 'unknown'}`);
 }
 
@@ -1643,8 +1752,7 @@ async function playLightweightText(text, {
         });
         document.getElementById('has-stage')?.classList.remove('has-open');
         openAudioPlayer();
-        audio.volume = Math.max(0, Math.min(1, Number(settings.volume || 1)));
-        audio.playbackRate = Math.max(0.5, Math.min(3, Number(settings.playbackRate || 1)));
+        applyPlaybackSettings(audio, item);
         audio.addEventListener('play', () => {
             if (!playbackSessions.isActive(session)) return;
             session.status = 'playing';
@@ -1704,7 +1812,7 @@ function loadAudioDuration(blobUrl) {
     });
 }
 
-function stopCurrentPlayback() {
+function stopCurrentPlayback(reason = 'stopped') {
     const stoppedSession = currentPlayback.session || playbackSessions.getActive();
     if (currentPlayback.audio) {
         try {
@@ -1715,7 +1823,7 @@ function stopCurrentPlayback() {
         }
     }
     currentPlayback.audio = null;
-    playbackSessions.cancel('stopped');
+    playbackSessions.cancel(reason);
     if (stoppedSession?.inlineDialogueKey) {
         setInlineDialogueButtonState(
             stoppedSession.inlineDialogueKey,
@@ -1739,6 +1847,13 @@ function stopCurrentPlayback() {
     document.getElementById('has-audio-player')?.classList.remove('visible');
     renderStage();
     renderAudioPlayer();
+}
+
+function invalidateSynthesisRouting(reason = 'synthesis_settings_changed') {
+    stopCurrentPlayback(reason);
+    inlineDialogueCacheGeneration += 1;
+    inlineDialogueButtonStates.clear();
+    refreshMessageButtons();
 }
 
 async function playAudiobookMessage(msg, button = null, { playbackUiOverride = null } = {}) {
@@ -1863,12 +1978,13 @@ async function playAudiobookMessage(msg, button = null, { playbackUiOverride = n
             emitSegmentChanged(session, index);
             showLinkedSegment(index);
             setStageProgress(0, item.duration || 0);
-            audio.volume = Math.max(0, Math.min(1, Number(getSettings().volume || 1)));
-            audio.playbackRate = Math.max(0.5, Math.min(2, Number(getSettings().playbackRate || 1)));
             if (audio.src !== item.blobUrl) {
                 audio.src = item.blobUrl;
                 audio.load();
             }
+            // Loading a new source may reset playbackRate on mobile browsers.
+            // Reapply playback-only settings for every queued segment immediately before play().
+            applyPlaybackSettings(audio, item);
             if (seekTime > 0 && audio.readyState >= 1) audio.currentTime = seekTime;
             try {
                 await audio.play();
@@ -2039,8 +2155,19 @@ function ensureSettingsPanel() {
                         <label class="has-field"><span>APP ID</span><input id="has-doubao-app-id" class="text_pole" type="text" autocomplete="off" placeholder="火山引擎语音应用 APP ID"></label>
                         <label class="has-field"><span>Access Key</span><input id="has-doubao-access-key" class="text_pole" type="password" autocomplete="off" placeholder="X-Api-Access-Key"></label>
                         <label class="has-field"><span>资源类型</span><select id="has-doubao-resource-id" class="text_pole"><option value="seed-tts-2.0">Seed TTS 2.0 合成音色</option><option value="seed-icl-2.0">Seed ICL 2.0 复刻音色</option></select></label>
-                        <label class="has-field"><span>Speaker ID</span><input id="has-doubao-speaker-id" class="text_pole" type="text" placeholder="例如 zh_female_xxx_bigtts"></label>
+                        <label class="has-field"><span>Speaker ID</span><div id="has-doubao-speaker-id" class="has-voice-combobox"><button class="has-voice-combobox-toggle text_pole" type="button" aria-haspopup="listbox" aria-expanded="false"><span>选择音色</span><i class="fa-solid fa-chevron-down" aria-hidden="true"></i></button><div class="has-voice-combobox-popover" hidden><input class="has-voice-search text_pole" type="search" autocomplete="off" placeholder="搜索名称、ID、Locale、Gender" aria-label="搜索测试声音 Speaker ID"><div class="has-voice-options" role="listbox"></div></div></div></label>
                         <label class="has-field"><span>语气提示（可选）</span><input id="has-doubao-context-text" class="text_pole" type="text" maxlength="2000" placeholder="例如：温柔、自然地讲述"></label>
+                    </div>
+                    <div id="has-cloud-quick" class="has-provider-quick" data-testid="has-cloud-quick" hidden>
+                        <div class="has-provider-quick-title"><strong id="has-cloud-quick-title">云 TTS 连接</strong><small>API Key 保存在 SillyTavern 共享设置中，未经额外加密；请求仅经本机酒馆服务器代理。</small></div>
+                        <label class="has-field"><span>API Key</span><input id="has-cloud-api-key" class="text_pole" type="password" autocomplete="off"></label>
+                        <label id="has-cloud-platform-row" class="has-field"><span>MiniMax 区域</span><select id="has-cloud-platform" class="text_pole"><option value="cn">国内站 minimaxi.com</option><option value="io">国际站 minimax.io</option></select></label>
+                        <label class="has-field"><span>模型</span><select id="has-cloud-model" class="text_pole"></select></label>
+                        <label id="has-cloud-custom-model-row" class="has-field" hidden><span>自定义模型</span><input id="has-cloud-custom-model" class="text_pole" type="text" placeholder="输入模型 ID"></label>
+                        <label class="has-field"><span>默认音色</span><div id="has-cloud-voice" class="has-voice-combobox"><button class="has-voice-combobox-toggle text_pole" type="button" aria-haspopup="listbox" aria-expanded="false"><span>选择音色</span><i class="fa-solid fa-chevron-down" aria-hidden="true"></i></button><div class="has-voice-combobox-popover" hidden><input class="has-voice-search text_pole" type="search" autocomplete="off" placeholder="搜索名称、ID、Locale、Gender" aria-label="搜索云 TTS 测试音色"><div class="has-voice-options" role="listbox"></div></div></div></label>
+                        <div id="has-minimax-voice-actions" class="has-service-actions" hidden><button id="has-minimax-refresh-voices" class="menu_button" type="button"><i class="fa-solid fa-rotate" aria-hidden="true"></i> 刷新官方音色</button><span id="has-minimax-voice-status" class="has-muted" role="status" aria-live="polite">填写 API Key 后可刷新</span></div>
+                        <label class="has-field"><span>音频格式</span><select id="has-cloud-format" class="text_pole"><option value="mp3">MP3</option><option value="wav">WAV</option></select></label>
+                        <label class="has-field"><span>风格/情绪提示（可选）</span><input id="has-cloud-style" class="text_pole" type="text" maxlength="1000"></label>
                     </div>
                     <button id="has-profile-test" class="menu_button has-primary-action" type="button"><i class="fa-solid fa-plug" aria-hidden="true"></i> 测试连接</button>
                     <div id="has-provider-status" class="has-service-status has-muted" role="status" aria-live="polite">尚未测试连接。</div>
@@ -2053,8 +2180,8 @@ function ensureSettingsPanel() {
 
                 <section class="has-settings-card" data-testid="has-lightweight-step-playback">
                     <div class="has-step-heading"><span>3</span><div><strong>调整播放手感</strong><small>这些设置不会改变声音分配。</small></div></div>
-                    <label class="has-field"><span>合成语速 <span id="has-synthesis-speed-value"></span></span><input id="has-synthesis-speed" type="range" min="0.5" max="2" step="0.1"></label>
-                    <label class="has-field"><span>播放倍速 <span id="has-speed-value"></span></span><input id="has-speed" type="range" min="0.5" max="3" step="0.1"></label>
+                    <label class="has-field"><span>角色台词语速 <span id="has-synthesis-speed-value"></span></span><input id="has-synthesis-speed" type="range" min="0.5" max="3" step="0.1"></label>
+                    <label class="has-field"><span>旁白语速 <span id="has-speed-value"></span></span><input id="has-speed" type="range" min="0.5" max="3" step="0.1"></label>
                     <label class="has-field"><span>音量 <span id="has-volume-value"></span></span><input id="has-volume" type="range" min="0" max="1" step="0.05"></label>
                     <label class="checkbox_label"><input id="has-shared-cache" type="checkbox"><span>PC 和手机共用已生成声音</span></label>
                     <div class="has-daily-hint"><i class="fa-solid fa-circle-info" aria-hidden="true"></i><span>回到聊天后，可使用消息右上角按钮朗读整条、选中文字或当前段落；角色台词旁的小耳机只读该句。</span></div>
@@ -2078,11 +2205,14 @@ function ensureSettingsPanel() {
                             <button id="has-profile-delete" class="menu_button" type="button">删除服务</button>
                         </div>
                         <label class="has-field"><span>服务名称</span><input id="has-profile-name" class="text_pole" type="text"></label>
-                        <label class="has-field"><span>服务类型</span><select id="has-profile-type" class="text_pole"><option value="openai-compatible">OpenAI 兼容</option><option value="edge">Edge</option><option value="doubao">豆包原生</option></select></label>
+                        <label class="has-field"><span>服务类型</span><select id="has-profile-type" class="text_pole"><option value="openai-compatible">OpenAI 兼容</option><option value="edge">Edge</option><option value="doubao">豆包原生</option><option value="minimax">MiniMax 原生</option><option value="xiaomi-mimo">小米 MiMo 原生</option></select></label>
                         <label class="has-field" data-profile-types="openai-compatible"><span>接口地址</span><input id="has-profile-endpoint" class="text_pole" type="text"></label>
-                        <label class="has-field" data-profile-types="openai-compatible"><span>API Key（共享设置，非加密）</span><input id="has-profile-api-key" class="text_pole" type="password" autocomplete="off"></label>
-                        <label class="has-field" data-profile-types="openai-compatible"><span>模型</span><input id="has-profile-model" class="text_pole" type="text"></label>
+                        <label class="has-field" data-profile-types="openai-compatible minimax xiaomi-mimo"><span>API Key（共享设置，非加密）</span><input id="has-profile-api-key" class="text_pole" type="password" autocomplete="off"></label>
+                        <label class="has-field" data-profile-types="openai-compatible minimax xiaomi-mimo"><span>模型</span><input id="has-profile-model" class="text_pole" type="text"></label>
                         <label class="has-field"><span>默认音色</span><input id="has-profile-voice" class="text_pole" type="text"></label>
+                        <label class="has-field" data-profile-types="minimax"><span>MiniMax 区域</span><select id="has-profile-platform" class="text_pole"><option value="cn">国内站</option><option value="io">国际站</option></select></label>
+                        <label class="has-field" data-profile-types="minimax xiaomi-mimo"><span>音频格式</span><select id="has-profile-format" class="text_pole"><option value="mp3">MP3</option><option value="wav">WAV</option></select></label>
+                        <label class="has-field" data-profile-types="minimax xiaomi-mimo"><span>风格/情绪提示</span><input id="has-profile-style" class="text_pole" type="text" maxlength="1000"></label>
                         <label class="has-field" data-profile-types="openai-compatible"><span>请求方式</span><select id="has-profile-request-mode" class="text_pole"><option value="server-proxy">酒馆服务器代理（推荐）</option><option value="direct">浏览器直连</option></select></label>
                         <div class="has-service-actions">
                             <button id="has-config-export" class="menu_button" type="button">导出配置</button>
@@ -2313,12 +2443,17 @@ function fillRouteVoiceSelect(select, settings, profileId, selectedVoice = '') {
     const isDoubao = profile?.type === 'doubao';
     const isEdge = profile?.type === 'edge';
     const isIndexTts = isIndexTtsProfile(profile);
+    const isMinimax = profile?.type === 'minimax';
+    const isXiaomiMimo = profile?.type === 'xiaomi-mimo';
+    const minimaxVoices = normalizeDiscoveredMinimaxVoices(profile?.discoveredVoices);
     const host = select.querySelector('.has-voice-options');
     host.replaceChildren();
     const usedItems = [];
     for (const voiceId of voices) {
         const catalogVoice = isDoubao ? getDoubaoCatboxVoice(voiceId) : null;
         const edgeVoice = isEdge ? getEdgeCatalogVoice(voiceId) : null;
+        const minimaxVoice = isMinimax ? minimaxVoices.find(voice => voice.voiceId === voiceId) : null;
+        const xiaomiVoice = isXiaomiMimo ? getXiaomiMimoVoice(voiceId) : null;
         if (catalogVoice) {
             usedItems.push({
                 value: voiceId,
@@ -2335,6 +2470,22 @@ function fillRouteVoiceSelect(select, settings, profileId, selectedVoice = '') {
                 name,
                 meta: `${edgeVoice.locale} · ${edgeVoice.gender} · ${voiceId}`,
                 selectionLabel: `${name} · ${edgeVoice.locale}`,
+            });
+        } else if (minimaxVoice) {
+            usedItems.push({
+                value: voiceId,
+                label: minimaxVoice.name,
+                name: minimaxVoice.name,
+                meta: [minimaxVoice.description, voiceId].filter(Boolean).join(' · '),
+                selectionLabel: minimaxVoice.name,
+            });
+        } else if (xiaomiVoice) {
+            usedItems.push({
+                value: voiceId,
+                label: xiaomiVoice.name,
+                name: xiaomiVoice.name,
+                meta: `${xiaomiVoice.meta} · ${voiceId}`,
+                selectionLabel: xiaomiVoice.name,
             });
         } else if (isIndexTts && /\.wav$/i.test(voiceId)) {
             const name = voiceId.replace(/\.wav$/i, '');
@@ -2391,6 +2542,39 @@ function fillRouteVoiceSelect(select, settings, profileId, selectedVoice = '') {
                 searchText: 'IndexTTS2 ckyp',
             })));
         addVoiceComboboxGroup(host, '添加音色', [{ value: CUSTOM_VOICE_OPTION, label: '手动添加音色 ID…' }]);
+    } else if (isMinimax) {
+        const usedVoiceIds = new Set(voices);
+        const minimaxGroups = [
+            ['MiniMax 官方系统音色', 'system'],
+            ['MiniMax 我的复刻音色', 'voice_cloning'],
+            ['MiniMax 我的生成音色', 'voice_generation'],
+        ];
+        for (const [label, kind] of minimaxGroups) {
+            addVoiceComboboxGroup(host, label, minimaxVoices
+                .filter(voice => voice.kind === kind && !usedVoiceIds.has(voice.voiceId))
+                .map(voice => ({
+                    value: voice.voiceId,
+                    label: voice.name,
+                    name: voice.name,
+                    meta: [voice.description, voice.voiceId].filter(Boolean).join(' · '),
+                    selectionLabel: voice.name,
+                    searchText: `${voice.kind} ${voice.description}`,
+                })));
+        }
+        addVoiceComboboxGroup(host, '添加音色', [{ value: CUSTOM_VOICE_OPTION, label: '手动添加 Voice ID…' }]);
+    } else if (isXiaomiMimo) {
+        const usedVoiceIds = new Set(voices);
+        addVoiceComboboxGroup(host, '小米 MiMo 预置音色', XIAOMI_MIMO_VOICES
+            .filter(voice => !usedVoiceIds.has(voice.voiceId))
+            .map(voice => ({
+                value: voice.voiceId,
+                label: voice.name,
+                name: voice.name,
+                meta: `${voice.meta} · ${voice.voiceId}`,
+                selectionLabel: voice.name,
+                searchText: voice.meta,
+            })));
+        addVoiceComboboxGroup(host, '添加音色', [{ value: CUSTOM_VOICE_OPTION, label: '手动添加 Voice…' }]);
     } else {
         addVoiceComboboxGroup(host, '添加音色', [{ value: CUSTOM_VOICE_OPTION, label: '手动添加音色 ID…' }]);
     }
@@ -2429,6 +2613,37 @@ function getSelectedProfile(container, settings = getSettings()) {
     return getEditingProfile(settings);
 }
 
+function renderCloudModelSelect(container, profile) {
+    const select = container?.querySelector?.('#has-cloud-model');
+    const customRow = container?.querySelector?.('#has-cloud-custom-model-row');
+    const customInput = container?.querySelector?.('#has-cloud-custom-model');
+    if (!select || !profile || !['minimax', 'xiaomi-mimo'].includes(profile.type)) return;
+    const options = getCloudModelOptions(profile.type);
+    const current = String(profile.model || (profile.type === 'minimax' ? 'speech-2.8-hd' : 'mimo-v2.5-tts')).trim();
+    select.replaceChildren();
+    for (const model of options) {
+        const option = new Option(model.label, model.value, false, model.value === current);
+        option.disabled = model.enabled === false;
+        select.add(option);
+    }
+    const known = options.some(model => model.value === current);
+    if (profile.type === 'minimax') {
+        select.add(new Option('自定义模型…', CUSTOM_CLOUD_MODEL_OPTION, false, !known));
+        if (customInput) customInput.value = known ? '' : current;
+        if (customRow) customRow.hidden = known;
+    } else {
+        if (!known && current) select.add(new Option(`${current}（已有自定义配置）`, current, false, true));
+        if (customInput) customInput.value = '';
+        if (customRow) customRow.hidden = true;
+    }
+}
+
+function readCloudModelValue(container, profile) {
+    const selected = String(container?.querySelector?.('#has-cloud-model')?.value || '').trim();
+    if (selected !== CUSTOM_CLOUD_MODEL_OPTION) return selected;
+    return String(container?.querySelector?.('#has-cloud-custom-model')?.value || profile?.model || '').trim();
+}
+
 function syncRouteModeVisibility(container, mode = 'mixed') {
     const activeMode = ['mixed', 'dialogue-only', 'single-voice'].includes(mode) ? mode : 'mixed';
     for (const field of container?.querySelectorAll?.('[data-route-modes]') || []) {
@@ -2464,6 +2679,14 @@ function syncProfileTypeVisibility(container, profile) {
     }
     const doubaoQuick = container?.querySelector?.('#has-doubao-quick');
     if (doubaoQuick) doubaoQuick.hidden = type !== 'doubao';
+    const cloudQuick = container?.querySelector?.('#has-cloud-quick');
+    if (cloudQuick) cloudQuick.hidden = !['minimax', 'xiaomi-mimo'].includes(type);
+    const cloudTitle = container?.querySelector?.('#has-cloud-quick-title');
+    if (cloudTitle) cloudTitle.textContent = type === 'minimax' ? 'MiniMax 原生连接' : '小米 MiMo 原生连接';
+    const platformRow = container?.querySelector?.('#has-cloud-platform-row');
+    if (platformRow) platformRow.hidden = type !== 'minimax';
+    const minimaxVoiceActions = container?.querySelector?.('#has-minimax-voice-actions');
+    if (minimaxVoiceActions) minimaxVoiceActions.hidden = type !== 'minimax';
 }
 
 function renderTtsConfiguration(container = document.getElementById('has-settings')) {
@@ -2498,11 +2721,25 @@ function renderTtsConfiguration(container = document.getElementById('has-setting
         container.querySelector('#has-profile-model').value = profile.model || '';
         container.querySelector('#has-profile-voice').value = profile.type === 'edge' ? (profile.edgeVoice || '') : (profile.defaultVoice || '');
         container.querySelector('#has-profile-request-mode').value = profile.requestMode || 'server-proxy';
+        container.querySelector('#has-profile-platform').value = profile.platform || 'cn';
+        container.querySelector('#has-profile-format').value = profile.responseFormat || (profile.type === 'minimax' ? 'mp3' : 'wav');
+        container.querySelector('#has-profile-style').value = profile.style || '';
         container.querySelector('#has-doubao-app-id').value = profile.appId || '';
         container.querySelector('#has-doubao-access-key').value = profile.accessKey || '';
         container.querySelector('#has-doubao-resource-id').value = profile.resourceId || 'seed-tts-2.0';
-        container.querySelector('#has-doubao-speaker-id').value = profile.defaultVoice || '';
+        fillRouteVoiceSelect(
+            container.querySelector('#has-doubao-speaker-id'),
+            settings,
+            profile.id,
+            profile.defaultVoice || '',
+        );
         container.querySelector('#has-doubao-context-text').value = profile.contextText || '';
+        container.querySelector('#has-cloud-api-key').value = ['minimax', 'xiaomi-mimo'].includes(profile.type) ? (profile.apiKey || '') : '';
+        container.querySelector('#has-cloud-platform').value = profile.platform || 'cn';
+        renderCloudModelSelect(container, profile);
+        fillRouteVoiceSelect(container.querySelector('#has-cloud-voice'), settings, profile.id, profile.defaultVoice || '');
+        container.querySelector('#has-cloud-format').value = profile.responseFormat || (profile.type === 'minimax' ? 'mp3' : 'wav');
+        container.querySelector('#has-cloud-style').value = profile.style || '';
     }
     syncProfileTypeVisibility(container, profile);
 }
@@ -2541,7 +2778,7 @@ function bindTtsConfiguration(container, settings) {
         settings.readNarration = preset?.mode !== 'dialogue-only';
         saveSettings();
         syncSettingsPanel(container);
-        refreshMessageButtons();
+        invalidateSynthesisRouting('routing_preset_changed');
     });
     container.querySelector('#has-preset-new')?.addEventListener('click', () => {
         const name = prompt('新预设名称', '新朗读预设')?.trim();
@@ -2552,6 +2789,7 @@ function bindTtsConfiguration(container, settings) {
         settings.activeRoutingPresetId = id;
         saveSettings();
         syncSettingsPanel(container);
+        invalidateSynthesisRouting('routing_preset_changed');
     });
     container.querySelector('#has-preset-copy')?.addEventListener('click', () => {
         const source = getActivePreset(settings);
@@ -2561,6 +2799,7 @@ function bindTtsConfiguration(container, settings) {
         settings.activeRoutingPresetId = id;
         saveSettings();
         syncSettingsPanel(container);
+        invalidateSynthesisRouting('routing_preset_changed');
     });
     container.querySelector('#has-preset-rename')?.addEventListener('click', () => {
         const preset = getActivePreset(settings);
@@ -2579,6 +2818,7 @@ function bindTtsConfiguration(container, settings) {
         settings.activeRoutingPresetId = Object.keys(settings.routingPresets)[0];
         saveSettings();
         syncSettingsPanel(container);
+        invalidateSynthesisRouting('routing_preset_changed');
     });
 
     const updatePreset = () => {
@@ -2601,7 +2841,7 @@ function bindTtsConfiguration(container, settings) {
         saveSettings();
         syncRouteModeVisibility(container, preset.mode);
         renderVoiceMap(container);
-        refreshMessageButtons();
+        invalidateSynthesisRouting('tts_route_changed');
     };
     container.querySelector('#has-preset-mode')?.addEventListener('change', updatePreset);
     const routeControls = [
@@ -2657,7 +2897,7 @@ function bindTtsConfiguration(container, settings) {
         saveSettings();
         renderTtsConfiguration(container);
         renderVoiceMap(container);
-        refreshMessageButtons();
+        invalidateSynthesisRouting('character_overrides_changed');
         toastSuccess(`已清除 ${removed.length} 个旧 Index 角色覆盖`);
     });
 
@@ -2699,12 +2939,25 @@ function bindTtsConfiguration(container, settings) {
     const updateProfile = () => {
         const profile = getEditingProfile(settings);
         if (!profile) return;
+        const previousSynthesisSettings = stableSerialize({
+            type: profile.type,
+            endpoint: profile.endpoint,
+            model: profile.model,
+            edgeVoice: profile.edgeVoice,
+            defaultVoice: profile.defaultVoice,
+            platform: profile.platform,
+            responseFormat: profile.responseFormat,
+            style: profile.style,
+        });
         profile.name = container.querySelector('#has-profile-name').value.trim() || profile.id;
         profile.type = container.querySelector('#has-profile-type').value;
         profile.endpoint = container.querySelector('#has-profile-endpoint').value.trim();
         profile.apiKey = container.querySelector('#has-profile-api-key').value;
         profile.model = container.querySelector('#has-profile-model').value.trim();
         profile.requestMode = container.querySelector('#has-profile-request-mode').value;
+        profile.platform = container.querySelector('#has-profile-platform').value || 'cn';
+        profile.responseFormat = container.querySelector('#has-profile-format').value || (profile.type === 'minimax' ? 'mp3' : 'wav');
+        profile.style = container.querySelector('#has-profile-style').value.trim();
         const voice = container.querySelector('#has-profile-voice').value.trim();
         if (profile.type === 'edge') profile.edgeVoice = voice;
         else profile.defaultVoice = voice;
@@ -2712,31 +2965,170 @@ function bindTtsConfiguration(container, settings) {
             profile.resourceId ||= 'seed-tts-2.0';
             profile.requestMode = 'server-proxy';
         }
+        if (['minimax', 'xiaomi-mimo'].includes(profile.type)) profile.requestMode = 'server-proxy';
         saveSettings();
         renderTtsConfiguration(container);
+        const nextSynthesisSettings = stableSerialize({
+            type: profile.type,
+            endpoint: profile.endpoint,
+            model: profile.model,
+            edgeVoice: profile.edgeVoice,
+            defaultVoice: profile.defaultVoice,
+            platform: profile.platform,
+            responseFormat: profile.responseFormat,
+            style: profile.style,
+        });
+        if (previousSynthesisSettings !== nextSynthesisSettings) {
+            invalidateSynthesisRouting('provider_synthesis_settings_changed');
+        }
     };
     for (const selector of [
         '#has-profile-name', '#has-profile-type', '#has-profile-endpoint', '#has-profile-api-key',
         '#has-profile-model', '#has-profile-voice', '#has-profile-request-mode',
+        '#has-profile-platform', '#has-profile-format', '#has-profile-style',
     ]) container.querySelector(selector)?.addEventListener('change', updateProfile);
 
     const updateDoubaoProfile = () => {
         const profile = getSelectedProfile(container, settings);
         if (!profile || profile.type !== 'doubao') return;
+        const previousSynthesisSettings = stableSerialize({
+            resourceId: profile.resourceId,
+            defaultVoice: profile.defaultVoice,
+            contextText: profile.contextText,
+        });
         profile.appId = container.querySelector('#has-doubao-app-id').value.trim();
         profile.accessKey = container.querySelector('#has-doubao-access-key').value;
         profile.resourceId = container.querySelector('#has-doubao-resource-id').value || 'seed-tts-2.0';
-        profile.defaultVoice = container.querySelector('#has-doubao-speaker-id').value.trim();
+        profile.defaultVoice = String(container.querySelector('#has-doubao-speaker-id').value || '').trim();
         profile.contextText = container.querySelector('#has-doubao-context-text').value.trim();
         profile.requestMode = 'server-proxy';
         saveSettings();
         renderTtsConfiguration(container);
-        refreshMessageButtons();
+        const nextSynthesisSettings = stableSerialize({
+            resourceId: profile.resourceId,
+            defaultVoice: profile.defaultVoice,
+            contextText: profile.contextText,
+        });
+        if (previousSynthesisSettings !== nextSynthesisSettings) {
+            invalidateSynthesisRouting('doubao_synthesis_settings_changed');
+        }
     };
     for (const selector of [
         '#has-doubao-app-id', '#has-doubao-access-key', '#has-doubao-resource-id',
-        '#has-doubao-speaker-id', '#has-doubao-context-text',
+        '#has-doubao-context-text',
     ]) container.querySelector(selector)?.addEventListener('change', updateDoubaoProfile);
+    const doubaoSpeakerSelect = container.querySelector('#has-doubao-speaker-id');
+    doubaoSpeakerSelect?.addEventListener('change', () => {
+        const profile = getSelectedProfile(container, settings);
+        if (!profile || profile.type !== 'doubao') return;
+        if (doubaoSpeakerSelect.value === CUSTOM_VOICE_OPTION) {
+            const voiceId = prompt('输入新的 Speaker ID', '')?.trim();
+            if (!voiceId) {
+                fillRouteVoiceSelect(doubaoSpeakerSelect, settings, profile.id, profile.defaultVoice || '');
+                return;
+            }
+            rememberProfileVoice(profile, voiceId);
+            fillRouteVoiceSelect(doubaoSpeakerSelect, settings, profile.id, voiceId);
+        } else {
+            rememberProfileVoice(profile, doubaoSpeakerSelect.value);
+        }
+        warnIfDoubaoIclResourceMismatch(profile, doubaoSpeakerSelect.value);
+        updateDoubaoProfile();
+    });
+
+    const updateCloudProfile = () => {
+        const profile = getSelectedProfile(container, settings);
+        if (!profile || !['minimax', 'xiaomi-mimo'].includes(profile.type)) return;
+        profile.apiKey = container.querySelector('#has-cloud-api-key').value;
+        profile.platform = container.querySelector('#has-cloud-platform').value || 'cn';
+        profile.model = readCloudModelValue(container, profile)
+            || (profile.type === 'minimax' ? 'speech-2.8-hd' : 'mimo-v2.5-tts');
+        profile.defaultVoice = String(container.querySelector('#has-cloud-voice').value || '').trim();
+        profile.responseFormat = container.querySelector('#has-cloud-format').value || (profile.type === 'minimax' ? 'mp3' : 'wav');
+        profile.style = container.querySelector('#has-cloud-style').value.trim();
+        profile.requestMode = 'server-proxy';
+        saveSettings();
+        renderTtsConfiguration(container);
+        invalidateSynthesisRouting('cloud_synthesis_settings_changed');
+    };
+    for (const selector of [
+        '#has-cloud-api-key', '#has-cloud-platform', '#has-cloud-format', '#has-cloud-style',
+    ]) container.querySelector(selector)?.addEventListener('change', updateCloudProfile);
+    container.querySelector('#has-cloud-model')?.addEventListener('change', event => {
+        const profile = getSelectedProfile(container, settings);
+        const customRow = container.querySelector('#has-cloud-custom-model-row');
+        if (event.target.value === CUSTOM_CLOUD_MODEL_OPTION) {
+            customRow.hidden = false;
+            container.querySelector('#has-cloud-custom-model')?.focus();
+            return;
+        }
+        customRow.hidden = true;
+        if (profile?.type === 'xiaomi-mimo' && event.target.selectedOptions?.[0]?.disabled) return;
+        updateCloudProfile();
+    });
+    container.querySelector('#has-cloud-custom-model')?.addEventListener('change', updateCloudProfile);
+    const cloudVoiceSelect = container.querySelector('#has-cloud-voice');
+    cloudVoiceSelect?.addEventListener('change', () => {
+        const profile = getSelectedProfile(container, settings);
+        if (!profile || !['minimax', 'xiaomi-mimo'].includes(profile.type)) return;
+        if (cloudVoiceSelect.value === CUSTOM_VOICE_OPTION) {
+            const label = profile.type === 'minimax' ? 'Voice ID' : 'Voice';
+            const voiceId = prompt(`输入新的 ${label}`, '')?.trim();
+            if (!voiceId) {
+                fillRouteVoiceSelect(cloudVoiceSelect, settings, profile.id, profile.defaultVoice || '');
+                return;
+            }
+            rememberProfileVoice(profile, voiceId);
+            fillRouteVoiceSelect(cloudVoiceSelect, settings, profile.id, voiceId);
+        } else {
+            rememberProfileVoice(profile, cloudVoiceSelect.value);
+        }
+        updateCloudProfile();
+    });
+    container.querySelector('#has-minimax-refresh-voices')?.addEventListener('click', async event => {
+        const profile = getSelectedProfile(container, settings);
+        if (!profile || profile.type !== 'minimax') return;
+        const apiKey = container.querySelector('#has-cloud-api-key').value;
+        const platform = container.querySelector('#has-cloud-platform').value || 'cn';
+        if (!apiKey.trim()) return toastWarn('请先填写 MiniMax API Key');
+        const button = event.currentTarget;
+        const status = container.querySelector('#has-minimax-voice-status');
+        const audit = beginAuditRun('minimax-voice-discovery');
+        button.disabled = true;
+        status.textContent = '正在刷新官方音色…';
+        try {
+            const response = await fetch('/api/plugins/hybrid-audiobook-stage/minimax-tts/voices', {
+                method: 'POST',
+                headers: getRequestHeaders(),
+                body: JSON.stringify({ apiKey, platform }),
+            });
+            if (!response.ok) throw new Error((await response.text()).slice(0, 300) || `HTTP ${response.status}`);
+            const payload = await response.json();
+            const voices = normalizeDiscoveredMinimaxVoices(payload?.voices);
+            profile.apiKey = apiKey;
+            profile.platform = platform;
+            profile.discoveredVoices = voices;
+            profile.voiceCatalogUpdatedAt = Date.now();
+            saveSettings();
+            renderTtsConfiguration(container);
+            const nextStatus = container.querySelector('#has-minimax-voice-status');
+            nextStatus.textContent = `已加载 ${voices.length} 个音色`;
+            Object.assign(audit.provider_ready, {
+                status: 'success', error: null, profile_id: profile.id, provider_type: profile.type,
+                probe_ok: true, voice_count: voices.length,
+            });
+        } catch (error) {
+            const message = error?.message || 'MiniMax 音色刷新失败';
+            status.textContent = `刷新失败：${message}`;
+            Object.assign(audit.provider_ready, {
+                status: 'fail', error: message, profile_id: profile.id, provider_type: profile.type, probe_ok: false,
+            });
+            audit.last_error = message;
+            toastError(message);
+        } finally {
+            button.disabled = false;
+        }
+    });
 
     container.querySelector('#has-profile-test')?.addEventListener('click', async () => {
         const audit = beginAuditRun('provider-probe');
@@ -2788,6 +3180,7 @@ function bindTtsConfiguration(container, settings) {
             ensureTtsSettingsV2(settings);
             saveSettings();
             syncSettingsPanel(container);
+            invalidateSynthesisRouting('tts_configuration_imported');
             toastSuccess('TTS 配置已导入');
         } catch (error) {
             toastError(`导入失败：${error.message}`);
@@ -2811,11 +3204,11 @@ function syncSettingsPanel(container = document.getElementById('has-settings')) 
     container.querySelector('#has-shared-cache-max').value = String(normalizeCacheLimitMb(settings.sharedAudioCacheMaxMb));
     container.querySelector('#has-local-cache-max').value = String(Math.max(32, Math.min(10240, Number(settings.localAudioCacheMaxMb) || 512)));
     container.querySelector('#has-speed').value = String(settings.playbackRate || 1);
-    container.querySelector('#has-synthesis-speed').value = String(settings.synthesisSpeed || 1);
+    container.querySelector('#has-synthesis-speed').value = String(settings.dialoguePlaybackRate || 1);
     container.querySelector('#has-prefetch-count').value = String(Math.max(0, Math.min(2, Number(settings.prefetchCount) || 2)));
     container.querySelector('#has-volume').value = String(settings.volume ?? 1);
     container.querySelector('#has-speed-value').textContent = `${Number(settings.playbackRate || 1).toFixed(1)}x`;
-    container.querySelector('#has-synthesis-speed-value').textContent = `${Number(settings.synthesisSpeed || 1).toFixed(1)}x`;
+    container.querySelector('#has-synthesis-speed-value').textContent = `${Number(settings.dialoguePlaybackRate || 1).toFixed(1)}x`;
     container.querySelector('#has-volume-value').textContent = Number(settings.volume ?? 1).toFixed(2);
     container.querySelector('#has-enabled').checked = !!settings.enabled;
     container.querySelector('#has-auto').checked = !!settings.autoAdvance;
@@ -2862,13 +3255,13 @@ function renderVoiceMap(container = document.getElementById('has-settings')) {
             delete settings.voiceMap[character];
             saveSettings();
             renderVoiceMap(container);
-            refreshMessageButtons();
+            invalidateSynthesisRouting('character_override_changed');
         });
         row.querySelector('.has-character-profile').addEventListener('change', event => {
             preset.characterOverrides[character] ||= { profileId: '', voiceId: route.voiceId || '' };
             preset.characterOverrides[character].profileId = event.target.value;
             saveSettings();
-            refreshMessageButtons();
+            invalidateSynthesisRouting('character_override_changed');
         });
         row.querySelector('.has-voice').addEventListener('change', event => {
             const voiceId = event.target.value.trim();
@@ -2876,14 +3269,14 @@ function renderVoiceMap(container = document.getElementById('has-settings')) {
             preset.characterOverrides[character].voiceId = voiceId;
             settings.voiceMap[character] = voiceId;
             saveSettings();
-            refreshMessageButtons();
+            invalidateSynthesisRouting('character_override_changed');
         });
         row.querySelector('.has-delete-voice').addEventListener('click', () => {
             delete preset.characterOverrides[character];
             delete settings.voiceMap[character];
             saveSettings();
             renderVoiceMap(container);
-            refreshMessageButtons();
+            invalidateSynthesisRouting('character_override_changed');
         });
         root.appendChild(row);
     }
@@ -2912,6 +3305,7 @@ function bindSettingsPanel(container) {
         if (preset) preset.mode = settings.readNarration === false ? 'dialogue-only' : 'mixed';
         saveSettings();
         renderTtsConfiguration(container);
+        invalidateSynthesisRouting('reading_mode_changed');
     });
     bindCheckbox('#has-shared-cache', 'sharedAudioCacheEnabled');
     bindCheckbox('#has-index-proxy', 'useServerIndexTtsProxy');
@@ -2926,12 +3320,13 @@ function bindSettingsPanel(container) {
     container.querySelector('#has-speed')?.addEventListener('input', event => {
         settings.playbackRate = Number(event.target.value) || 1;
         container.querySelector('#has-speed-value').textContent = `${settings.playbackRate.toFixed(1)}x`;
-        if (currentPlayback.audio) currentPlayback.audio.playbackRate = settings.playbackRate;
+        applyPlaybackSettings(currentPlayback.audio, currentPlayback.playlist?.[currentPlayback.index]);
         saveSettings();
     });
     container.querySelector('#has-synthesis-speed')?.addEventListener('input', event => {
-        settings.synthesisSpeed = Number(event.target.value) || 1;
-        container.querySelector('#has-synthesis-speed-value').textContent = `${settings.synthesisSpeed.toFixed(1)}x`;
+        settings.dialoguePlaybackRate = Number(event.target.value) || 1;
+        container.querySelector('#has-synthesis-speed-value').textContent = `${settings.dialoguePlaybackRate.toFixed(1)}x`;
+        applyPlaybackSettings(currentPlayback.audio, currentPlayback.playlist?.[currentPlayback.index]);
         saveSettings();
     });
     container.querySelector('#has-prefetch-count')?.addEventListener('change', event => {
@@ -2965,28 +3360,32 @@ function bindSettingsPanel(container) {
         voiceInput.value = '';
         saveSettings();
         renderVoiceMap(container);
-        refreshMessageButtons();
+        invalidateSynthesisRouting('character_override_changed');
     });
 
     container.querySelector('#has-tts-url')?.addEventListener('change', () => {
         const profile = settings.providerProfiles?.[LEGACY_OPENAI_PROFILE_ID];
         if (profile) profile.endpoint = settings.ttsApiUrl;
         saveSettings();
+        invalidateSynthesisRouting('legacy_endpoint_changed');
     });
     container.querySelector('#has-tts-model')?.addEventListener('change', () => {
         const profile = settings.providerProfiles?.[LEGACY_OPENAI_PROFILE_ID];
         if (profile) profile.model = settings.ttsModel;
         saveSettings();
+        invalidateSynthesisRouting('legacy_model_changed');
     });
     container.querySelector('#has-default-voice')?.addEventListener('change', () => {
         const profile = settings.providerProfiles?.[LEGACY_OPENAI_PROFILE_ID];
         if (profile) profile.defaultVoice = settings.defaultVoice;
         saveSettings();
+        invalidateSynthesisRouting('legacy_voice_changed');
     });
     container.querySelector('#has-edge-voice')?.addEventListener('change', () => {
         const profile = settings.providerProfiles?.[LEGACY_EDGE_PROFILE_ID];
         if (profile) profile.edgeVoice = settings.edgeVoice;
         saveSettings();
+        invalidateSynthesisRouting('legacy_voice_changed');
     });
 
     bindCheckbox('#has-enabled', 'enabled', ensureLauncher);
@@ -3680,6 +4079,8 @@ async function buildRoutedAudioCacheIdentity(segment) {
     if (profile.type === 'edge') return buildEdgeAudioCacheIdentity(segment);
     if (profile.type === 'openai-compatible') return buildIndexAudioCacheIdentity(segment);
     if (profile.type === 'doubao') return buildDoubaoAudioCacheIdentity(segment);
+    if (profile.type === 'minimax') return buildCloudAudioCacheIdentity(segment, 'minimax', MINIMAX_NATIVE_PROFILE_ID);
+    if (profile.type === 'xiaomi-mimo') return buildCloudAudioCacheIdentity(segment, 'xiaomi-mimo', XIAOMI_MIMO_PROFILE_ID);
     throw new Error(`不支持的 TTS Provider: ${profile.type || 'unknown'}`);
 }
 
@@ -3694,12 +4095,14 @@ function applyInlineCacheAvailability(key, hash, available, cacheChecked = true)
 }
 
 async function scanInlineDialogueCache(msg, analysis) {
+    const cacheGeneration = inlineDialogueCacheGeneration;
     const candidates = [];
     for (let index = 0; index < analysis.dialogues.length; index += 1) {
         const segment = analysis.dialogues[index];
         if (segment.routeError || !segment.profileId || !segment.voiceId) continue;
         try {
             const { hash } = await buildRoutedAudioCacheIdentity(segment);
+            if (cacheGeneration !== inlineDialogueCacheGeneration) return;
             const key = getInlineDialogueButtonKey(msg, index);
             const previous = inlineDialogueButtonStates.get(key);
             if (previous?.cacheHash === hash && previous.cacheChecked) {
@@ -3710,6 +4113,7 @@ async function scanInlineDialogueCache(msg, analysis) {
                 console.warn(`[${extensionName}] inline local cache check failed`, error);
                 return false;
             });
+            if (cacheGeneration !== inlineDialogueCacheGeneration) return;
             if (local) applyInlineCacheAvailability(key, hash, true);
             else applyInlineCacheAvailability(key, hash, false, false);
             candidates.push({ key, hash, local, checked: false });
@@ -3729,6 +4133,7 @@ async function scanInlineDialogueCache(msg, analysis) {
             console.warn(`[${extensionName}] inline server cache check failed`, error);
         }
     }
+    if (cacheGeneration !== inlineDialogueCacheGeneration) return;
     misses.forEach(item => applyInlineCacheAvailability(
         item.key,
         item.hash,

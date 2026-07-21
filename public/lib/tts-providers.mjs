@@ -65,6 +65,33 @@ export function buildDoubaoProxyPayload(profile, request) {
     return { appId, accessKey, resourceId, speaker, text, contextText };
 }
 
+export function buildMinimaxProxyPayload(profile, request) {
+    assertProfile(profile, 'minimax');
+    const text = ensureText(request?.text);
+    const apiKey = String(profile.apiKey || '').trim();
+    const voiceId = String(request?.voiceId || profile.defaultVoice || '').trim();
+    const model = String(profile.model || 'speech-2.8-hd').trim();
+    const platform = String(profile.platform || 'cn').trim();
+    const format = String(profile.responseFormat || 'mp3').trim();
+    const emotion = String(request?.emotion || profile.style || '').trim();
+    if (!apiKey) throw new Error('MiniMax Profile 缺少 API Key');
+    if (!voiceId) throw new Error('MiniMax Profile 缺少 Voice ID');
+    return { apiKey, platform, model, voiceId, text, format, emotion, speed: 1 };
+}
+
+export function buildXiaomiMimoProxyPayload(profile, request) {
+    assertProfile(profile, 'xiaomi-mimo');
+    const text = ensureText(request?.text);
+    const apiKey = String(profile.apiKey || '').trim();
+    const voiceId = String(request?.voiceId || profile.defaultVoice || '').trim();
+    const model = String(profile.model || 'mimo-v2.5-tts').trim();
+    const format = String(profile.responseFormat || 'wav').trim();
+    const style = String(request?.style || profile.style || '').trim();
+    if (!apiKey) throw new Error('小米 MiMo Profile 缺少 API Key');
+    if (!voiceId) throw new Error('小米 MiMo Profile 缺少 Voice');
+    return { apiKey, model, voiceId, text, format, style };
+}
+
 export function createProviderRegistry({
     fetchImpl = globalThis.fetch,
     getSillyTavernHeaders = () => ({ 'Content-Type': 'application/json' }),
@@ -191,6 +218,66 @@ export function createProviderRegistry({
                         speaker: payload.speaker,
                         text: payload.text,
                         contextText: payload.contextText,
+                    },
+                };
+            },
+        },
+        minimax: {
+            async probe(profile) {
+                buildMinimaxProxyPayload(profile, { text: '配置检查' });
+                return { ok: true, configured: true, unverified: true };
+            },
+            async listVoices() {
+                return [];
+            },
+            async synthesize(profile, request) {
+                const payload = buildMinimaxProxyPayload(profile, request);
+                const response = await fetchImpl(`${proxyBase}/minimax-tts/generate`, {
+                    method: 'POST',
+                    headers: getSillyTavernHeaders(),
+                    body: JSON.stringify(payload),
+                    signal: request.signal,
+                });
+                const audio = await readAudioResponse(response, profile.name || 'MiniMax TTS');
+                return {
+                    ...audio,
+                    providerId: 'minimax',
+                    profileId: profile.id,
+                    model: payload.model,
+                    voiceId: payload.voiceId,
+                    cacheDescriptor: {
+                        platform: payload.platform, model: payload.model, voiceId: payload.voiceId,
+                        text: payload.text, format: payload.format, emotion: payload.emotion,
+                    },
+                };
+            },
+        },
+        'xiaomi-mimo': {
+            async probe(profile) {
+                buildXiaomiMimoProxyPayload(profile, { text: '配置检查' });
+                return { ok: true, configured: true, unverified: true };
+            },
+            async listVoices() {
+                return [];
+            },
+            async synthesize(profile, request) {
+                const payload = buildXiaomiMimoProxyPayload(profile, request);
+                const response = await fetchImpl(`${proxyBase}/xiaomi-mimo-tts/generate`, {
+                    method: 'POST',
+                    headers: getSillyTavernHeaders(),
+                    body: JSON.stringify(payload),
+                    signal: request.signal,
+                });
+                const audio = await readAudioResponse(response, profile.name || '小米 MiMo TTS');
+                return {
+                    ...audio,
+                    providerId: 'xiaomi-mimo',
+                    profileId: profile.id,
+                    model: payload.model,
+                    voiceId: payload.voiceId,
+                    cacheDescriptor: {
+                        model: payload.model, voiceId: payload.voiceId, text: payload.text,
+                        format: payload.format, style: payload.style,
                     },
                 };
             },
