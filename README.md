@@ -2,7 +2,7 @@
 
 HybridAudiobookStage 是一个 SillyTavern 前端扩展，核心功能是用一套简洁界面完成旁白、角色台词、单句、全文、选中文字和当前段落的语音朗读。
 
-它支持 Edge TTS、IndexTTS2 / OpenAI 兼容接口和豆包原生 TTS，并让所有朗读入口共用同一套路由、播放队列与持久缓存。旧版视频字幕舞台仍然保留，但日常使用只需要操作“轻量 TTS”的三个步骤。
+它支持 Edge TTS、IndexTTS2 / OpenAI 兼容接口、豆包、MiniMax 和小米 MiMo 原生 TTS，并让所有朗读入口共用同一套路由、播放队列与持久缓存。旧版视频字幕舞台仍然保留，但日常使用只需要操作“轻量 TTS”的三个步骤。
 
 > 当前首个正式版本为 `v0.2.0`。公开接口仍在快速稳定阶段，升级前建议保留自己的 SillyTavern 设置备份。
 
@@ -51,10 +51,14 @@ SillyTavern/public/scripts/extensions/third-party/HybridAudiobookStage
 
 安装后刷新 SillyTavern，在扩展设置中应能看到“轻量 TTS”。
 
-### 2. 安装服务器插件（推荐）
+### 2. 安装服务器插件（原生云 TTS 必需）
+
+> SillyTavern 的“安装扩展”只会安装浏览器前端，不会自动把仓库中的服务器插件复制到 SillyTavern 根目录。使用 MiniMax、小米 MiMo、豆包或服务器共享缓存时，必须手动完成本步骤。
 
 以下功能需要服务器插件：
 
+- MiniMax 原生 TTS；
+- 小米 MiMo 原生 TTS；
 - 豆包原生 TTS；
 - 手机通过 SillyTavern 访问 PC 上的 IndexTTS2；
 - PC 与手机共享生成过的语音；
@@ -74,6 +78,20 @@ SillyTavern/plugins/HybridAudiobookStage-Launcher
 ```
 
 然后重启 SillyTavern。只刷新网页不会重新加载服务器插件。
+
+如果扩展是通过 GitHub 安装的，`server-plugin/HybridAudiobookStage-Launcher` 位于该扩展的安装目录中。也可以从 GitHub 仓库下载源码后复制。最终应形成：
+
+```text
+SillyTavern/
+├─ plugins/
+│  └─ HybridAudiobookStage-Launcher/
+│     ├─ index.js
+│     ├─ cloud-tts.js
+│     └─ doubao-tts.js
+└─ data/.../extensions/HybridAudiobookStage/   # GitHub 安装的前端，实际用户目录可能不同
+```
+
+升级扩展后，如果更新内容涉及原生 TTS、服务器缓存或诊断接口，请重新复制整个 `HybridAudiobookStage-Launcher` 文件夹并重启 SillyTavern。不要只复制 `index.js`，否则可能缺少 `cloud-tts.js` 等同版本模块。
 
 服务器插件可以通过环境变量配置 IndexTTS2：
 
@@ -298,6 +316,17 @@ PC 和手机应连接同一个 SillyTavern 服务器。`localhost`、`127.0.0.1`
 生成音频不会以 Base64 写入 SillyTavern 设置。浏览器本地缓存使用 IndexedDB，共享缓存使用 SillyTavern 用户文件目录。
 
 ## 常见问题
+
+### MiniMax、小米或缓存接口返回 HTTP 404
+
+这通常不是 API Key 错误，而是当前 SillyTavern 实例没有加载匹配版本的服务器插件。GitHub 扩展更新不会自动更新根目录下的 `plugins/HybridAudiobookStage-Launcher`。
+
+1. 从当前版本仓库重新复制整个 `server-plugin/HybridAudiobookStage-Launcher` 文件夹。
+2. 覆盖当前 SillyTavern 根目录中的 `plugins/HybridAudiobookStage-Launcher`。
+3. 重启实际提供当前端口的 SillyTavern 进程；只刷新网页无效。
+4. 回到设置页重新点击“测试连接”，再执行试听。
+
+如果同时运行多个 SillyTavern 端口，每个实例都有自己的根目录和 `plugins` 文件夹，需要分别安装并重启。
 
 ### 连接测试成功，但没有声音
 

@@ -192,6 +192,14 @@ test('persistent cache lookup is local-first and generation waits for IndexedDB 
     assert.match(source, /await saveCachedAudio\(record\);[\s\S]*?record\.localPersisted = true/);
 });
 
+test('server cache reads verify existence before downloading audio', () => {
+    const functionStart = source.indexOf('async function getServerCachedAudio');
+    const functionEnd = source.indexOf('async function findCachedAudio', functionStart);
+    const functionSource = source.slice(functionStart, functionEnd);
+    assert.match(functionSource, /verifyServerCachedAudio\(\[hash\], signal\)/);
+    assert.ok(functionSource.indexOf('verifyServerCachedAudio') < functionSource.indexOf('audio-cache\/\$\{encodeURIComponent\(hash\)\}'));
+});
+
 test('existing settings bindings keep exactly one matching control', () => {
     const requiredIds = [
         'has-tts-enabled', 'has-preset-select', 'has-preset-mode', 'has-profile-select',

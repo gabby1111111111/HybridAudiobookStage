@@ -252,6 +252,17 @@ async function init(router) {
         });
     });
 
+    router.post('/capabilities', (_req, res) => {
+        return res.json({
+            ok: true,
+            capabilities: {
+                minimaxTts: true,
+                xiaomiMimoTts: true,
+                sharedAudioCache: true,
+            },
+        });
+    });
+
     router.post('/start-index-tts2', (req, res) => {
         try {
             const batPath = normalizeBatPath(req.body?.batPath);

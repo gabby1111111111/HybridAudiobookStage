@@ -144,6 +144,43 @@ test('routes MiniMax and Xiaomi MiMo through fixed local proxies without credent
     assert.equal(JSON.stringify(mimoResult.cacheDescriptor).includes('mimo-secret'), false);
 });
 
+test('native cloud probes verify that the current SillyTavern server helper supports their routes', async () => {
+    const calls = [];
+    const registry = createProviderRegistry({
+        fetchImpl: async (url) => {
+            calls.push(url);
+            return new Response(JSON.stringify({
+                ok: true,
+                capabilities: { minimaxTts: true, xiaomiMimoTts: true },
+            }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        },
+    });
+    const minimax = {
+        id: 'minimax', type: 'minimax', enabled: true, apiKey: 'mini-secret',
+        defaultVoice: 'warm', model: 'speech-2.8-hd',
+    };
+    const mimo = {
+        id: 'mimo', type: 'xiaomi-mimo', enabled: true, apiKey: 'mimo-secret',
+        defaultVoice: 'mimo_default', model: 'mimo-v2.5-tts',
+    };
+    assert.equal((await registry.probe(minimax)).capability, 'minimaxTts');
+    assert.equal((await registry.probe(mimo)).capability, 'xiaomiMimoTts');
+    assert.deepEqual(calls, [
+        '/api/plugins/hybrid-audiobook-stage/capabilities',
+        '/api/plugins/hybrid-audiobook-stage/capabilities',
+    ]);
+});
+
+test('native cloud probe explains a stale server helper instead of reporting a false success', async () => {
+    const registry = createProviderRegistry({
+        fetchImpl: async () => new Response('Not found', { status: 404 }),
+    });
+    await assert.rejects(() => registry.probe({
+        id: 'minimax', type: 'minimax', enabled: true, apiKey: 'mini-secret',
+        defaultVoice: 'warm', model: 'speech-2.8-hd',
+    }), /服务端助手版本过旧/);
+});
+
 test('propagates abort and HTTP errors', async () => {
     const aborted = new AbortController();
     aborted.abort();

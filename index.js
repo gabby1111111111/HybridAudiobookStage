@@ -1084,6 +1084,8 @@ function blobToBase64(blob) {
 async function getServerCachedAudio(hash, fallbackMeta = {}, signal = undefined) {
     if (getSettings().sharedAudioCacheEnabled === false) return null;
     try {
+        const availability = await verifyServerCachedAudio([hash], signal);
+        if (!availability[hash]) return null;
         const response = await fetch(`/api/plugins/hybrid-audiobook-stage/audio-cache/${encodeURIComponent(hash)}`, {
             method: 'GET',
             cache: 'no-store',

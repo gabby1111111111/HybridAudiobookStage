@@ -25,6 +25,24 @@ async function readAudioResponse(response, label) {
     return { blob, mimeType };
 }
 
+async function probeServerCapability(fetchImpl, getHeaders, proxyBase, capability, signal) {
+    const response = await fetchImpl(`${proxyBase}/capabilities`, {
+        method: 'POST',
+        headers: getHeaders(),
+        body: '{}',
+        signal,
+    });
+    if (response.status === 404) {
+        throw new Error('当前 SillyTavern 的 HybridAudiobookStage 服务端助手版本过旧，请同步 server-plugin 后重启酒馆');
+    }
+    if (!response.ok) throw new Error(await response.text().catch(() => `HTTP ${response.status}`));
+    const payload = await response.json();
+    if (!payload?.capabilities?.[capability]) {
+        throw new Error(`当前 SillyTavern 服务端助手不支持 ${capability}，请更新后重启酒馆`);
+    }
+    return { ok: true, configured: true, capability };
+}
+
 export function buildOpenAiSpeechPayload(profile, request) {
     assertProfile(profile, 'openai-compatible');
     const text = ensureText(request?.text);
@@ -223,9 +241,9 @@ export function createProviderRegistry({
             },
         },
         minimax: {
-            async probe(profile) {
+            async probe(profile, signal) {
                 buildMinimaxProxyPayload(profile, { text: '配置检查' });
-                return { ok: true, configured: true, unverified: true };
+                return probeServerCapability(fetchImpl, getSillyTavernHeaders, proxyBase, 'minimaxTts', signal);
             },
             async listVoices() {
                 return [];
@@ -253,9 +271,9 @@ export function createProviderRegistry({
             },
         },
         'xiaomi-mimo': {
-            async probe(profile) {
+            async probe(profile, signal) {
                 buildXiaomiMimoProxyPayload(profile, { text: '配置检查' });
-                return { ok: true, configured: true, unverified: true };
+                return probeServerCapability(fetchImpl, getSillyTavernHeaders, proxyBase, 'xiaomiMimoTts', signal);
             },
             async listVoices() {
                 return [];
