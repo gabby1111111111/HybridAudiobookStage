@@ -56,6 +56,23 @@ export function parseDialogueLine(line) {
     return { character, emotionLabel, emotion, rawContent, text: spokenText };
 }
 
+// 新增：微信卡片格式（<chat_bubble>[外层昵称|[角色|情绪][向量]|「台词」]</chat_bubble>）
+// 在 extractContentBlock() 的 decodeVisibleText() 里会被当成 HTML 标签整体剥掉，
+// 剩下的是 [外层昵称|[角色|情绪][向量]|「台词」]，比裸TTS格式多一层外层方括号包装。
+// 这里不去猜外面剩下什么包装（标签有没有被剥掉、外层昵称怎么写），
+// 而是直接在整行里"搜索"内层这段完整TTS模式，抠出来喂给 parseDialogueLine。
+// parseDialogueLine 本身不需要任何改动。
+const NESTED_TTS_SNIPPET = '\\[[^\\[\\]|\\n]+(?:\\|[^\\[\\]\\n]*)?\\](?:\\[[\\d.,\\s-]+\\])?\\s*\\|\\s*[「“"](?:.*?)[」”"]';
+const NESTED_TTS_PATTERN = new RegExp(NESTED_TTS_SNIPPET);
+
+export function extractNestedTtsLine(line) {
+    const str = String(line || '');
+    // 整行本身就是纯TTS格式（旧的裸写场景），不用改，原样返回
+    if (parseDialogueLine(str)) return str;
+    const match = str.match(NESTED_TTS_PATTERN);
+    return match ? match[0] : str;
+}
+
 export function splitNarrationText(text) {
     const normalized = normalizeWhitespace(text).replace(/[ \t]+/g, ' ');
     if (!normalized) return [];
@@ -83,7 +100,8 @@ function findDialogueRanges(content) {
         if (!match[0] && linePattern.lastIndex >= content.length) break;
         const lineWithBreak = match[0];
         const line = lineWithBreak.replace(/\n$/, '');
-        const parsed = parseDialogueLine(line);
+        const ttsLine = extractNestedTtsLine(line); // 新增：先抠出嵌套TTS片段
+        const parsed = parseDialogueLine(ttsLine);   // 改：喂 ttsLine 而不是 line
         if (parsed) {
             const leading = line.length - line.trimStart().length;
             const trailing = line.length - line.trimEnd().length;

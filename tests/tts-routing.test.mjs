@@ -32,6 +32,36 @@ test('routes all single-voice segments to one target', () => {
     assert.equal(resolveSegmentRoute({ type: 'dialogue', character: 'Alice' }, singlePreset, profiles).profileId, 'local');
 });
 
+test('can ignore only a matching legacy character override for general selected-text playback', () => {
+    const migratedPreset = {
+        ...preset,
+        characterOverrides: {
+            Alice: { profileId: 'profile-openai-legacy', voiceId: 'alice.wav' },
+            Bob: { profileId: 'cloud', voiceId: 'bob' },
+        },
+    };
+    const migratedProfiles = {
+        ...profiles,
+        'profile-openai-legacy': {
+            id: 'profile-openai-legacy', name: 'IndexTTS2（迁移）', type: 'openai-compatible', enabled: true,
+        },
+    };
+
+    assert.equal(resolveSegmentRoute({ type: 'dialogue', character: 'Alice' }, migratedPreset, migratedProfiles).profileId, 'profile-openai-legacy');
+    assert.equal(resolveSegmentRoute(
+        { type: 'dialogue', character: 'Alice' },
+        migratedPreset,
+        migratedProfiles,
+        { ignoreCharacterOverrideProfileId: 'profile-openai-legacy' },
+    ).profileId, 'local');
+    assert.equal(resolveSegmentRoute(
+        { type: 'dialogue', character: 'Bob' },
+        migratedPreset,
+        migratedProfiles,
+        { ignoreCharacterOverrideProfileId: 'profile-openai-legacy' },
+    ).profileId, 'cloud');
+});
+
 test('does not silently fall back when a profile is missing or disabled', () => {
     assert.match(resolveSegmentRoute({ type: 'narration' }, { ...preset, narration: { profileId: 'missing' } }, profiles).error, /找不到/);
     const disabled = { ...profiles, edge: { ...profiles.edge, enabled: false } };

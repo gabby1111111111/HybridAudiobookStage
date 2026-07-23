@@ -92,6 +92,7 @@ const defaultSettings = {
     ttsSyncAutoAdvanceMigrated: false,
 
     ttsEnabled: true,
+    autoPlayAiReplies: false,
     ttsApiUrl: 'http://127.0.0.1:7880/v1/audio/speech',
     ttsModel: 'index-tts2',
     defaultVoice: 'default.wav',
@@ -137,6 +138,7 @@ let currentPlayback = {
 };
 
 let latestTextSelection = { text: '', paragraphText: '', messageId: '', msg: null };
+let lastAutoPlayedMessageKey = '';
 const inlineDialogueButtonStates = new Map();
 let inlineDialogueCacheGeneration = 0;
 
@@ -1676,24 +1678,47 @@ async function playLightweightText(text, {
     let matchedSegment = suppliedSegment;
     if (!matchedSegment && sourceMessage) {
         const normalizedTarget = normalizeWhitespace(cleanText);
-        matchedSegment = collectSegmentsFromMessage(sourceMessage).segments
-            .find(item => normalizeWhitespace(item.text) === normalizedTarget) || null;
+        const sourceSegments = collectSegmentsFromMessage(sourceMessage).segments;
+        matchedSegment = sourceSegments
+            .find(item => normalizeWhitespace(item.text) === normalizedTarget)
+            || sourceSegments.find(item => normalizeWhitespace(item.text).includes(normalizedTarget))
+            || null;
     }
-    const baseSegment = matchedSegment
+    let baseSegment = matchedSegment
         ? { ...matchedSegment, text: cleanText }
         : { type: 'single', character, text: cleanText };
-    const effectiveProfileId = String(profileId || baseSegment.profileId || '').trim();
+    const explicitProfileId = String(profileId || '').trim();
+    const explicitVoiceId = String(voiceId || '').trim();
+    const generalSelectionSource = source === 'selection' || source === 'paragraph';
+    const ignoreLegacySingleVoice = !matchedSegment
+        && generalSelectionSource
+        && !explicitProfileId
+        && !explicitVoiceId
+        && preset?.mode !== 'single-voice'
+        && preset?.singleVoice?.profileId === LEGACY_OPENAI_PROFILE_ID;
+    if (ignoreLegacySingleVoice) baseSegment = { ...baseSegment, type: 'dialogue' };
+    const legacyCharacterOverride = baseSegment.type === 'dialogue'
+        && preset?.characterOverrides?.[baseSegment.character]?.profileId === LEGACY_OPENAI_PROFILE_ID;
+    const ignoreLegacyCharacterOverride = !!matchedSegment
+        && generalSelectionSource
+        && !explicitProfileId
+        && !explicitVoiceId
+        && legacyCharacterOverride
+        && baseSegment.profileId === LEGACY_OPENAI_PROFILE_ID;
+    const effectiveProfileId = String(explicitProfileId || (ignoreLegacyCharacterOverride ? '' : baseSegment.profileId) || '').trim();
     const selectedProfile = settings.providerProfiles?.[effectiveProfileId];
-    const explicitVoiceId = String(voiceId || baseSegment.voiceId || selectedProfile?.defaultVoice || selectedProfile?.edgeVoice || '').trim();
+    const effectiveVoiceId = String(explicitVoiceId || (ignoreLegacyCharacterOverride ? '' : baseSegment.voiceId) || selectedProfile?.defaultVoice || selectedProfile?.edgeVoice || '').trim();
     const route = effectiveProfileId
         ? {
-            ok: !!selectedProfile && !!explicitVoiceId,
+            ok: !!selectedProfile && !!effectiveVoiceId,
             profileId: effectiveProfileId,
-            voiceId: explicitVoiceId,
+            voiceId: effectiveVoiceId,
             providerType: selectedProfile?.type,
-            error: !selectedProfile ? '找不到指定 TTS Profile' : (!explicitVoiceId ? '没有指定音色' : null),
+            error: !selectedProfile ? '找不到指定 TTS Profile' : (!effectiveVoiceId ? '没有指定音色' : null),
         }
-        : resolveSegmentRoute(baseSegment, preset, settings.providerProfiles);
+        : resolveSegmentRoute(baseSegment, preset, settings.providerProfiles, {
+            ignoreCharacterOverrideProfileId: ignoreLegacyCharacterOverride ? LEGACY_OPENAI_PROFILE_ID : '',
+        });
     const segment = {
         ...baseSegment,
         profileId: route.profileId,
@@ -1709,6 +1734,12 @@ async function playLightweightText(text, {
         toastError(route.error || '无法确定 TTS 路由');
         return false;
     }
+    Object.assign(audit.route_built, {
+        status: 'success', error: null, mode: 'single', narration_count: segment.type === 'narration' ? 1 : 0,
+        dialogue_count: segment.type === 'dialogue' ? 1 : 0,
+        legacy_override_bypassed: ignoreLegacyCharacterOverride,
+        legacy_single_voice_bypassed: ignoreLegacySingleVoice,
+    });
 
     stopCurrentPlayback();
     const session = playbackSessions.start({ source, segments: [segment] });
@@ -1797,7 +1828,7 @@ async function playLightweightText(text, {
         });
         audit.last_error = error?.message || String(error);
         emitPlaybackState(session, 'error', error.message);
-        const routeHint = segment.profileId === LEGACY_OPENAI_PROFILE_ID
+        const routeHint = segment.profileId === LEGACY_OPENAI_PROFILE_ID && legacyCharacterOverride && !ignoreLegacyCharacterOverride
             ? '；这句仍有旧的 IndexTTS2 特定角色覆盖，请在轻量 TTS 第 1 步清除旧 Index 覆盖'
             : '';
         toastError(`朗读失败：${error.message}${routeHint}`);
@@ -1858,8 +1889,8 @@ function invalidateSynthesisRouting(reason = 'synthesis_settings_changed') {
     refreshMessageButtons();
 }
 
-async function playAudiobookMessage(msg, button = null, { playbackUiOverride = null } = {}) {
-    const audit = beginAuditRun('speak:message');
+async function playAudiobookMessage(msg, button = null, { playbackUiOverride = null, source = 'message' } = {}) {
+    const audit = beginAuditRun(source === 'auto-message' ? 'speak:auto-message' : 'speak:message');
     if (getSettings().ttsEnabled === false) {
         audit.last_error = 'tts_disabled';
         toastWarn('请先启用有声书 TTS');
@@ -1876,7 +1907,7 @@ async function playAudiobookMessage(msg, button = null, { playbackUiOverride = n
         }
 
         stopCurrentPlayback();
-        session = playbackSessions.start({ source: 'message', segments: analysis.segments });
+        session = playbackSessions.start({ source, segments: analysis.segments });
         session.messageId = getMessageId(msg);
         session.currentInlineDialogueKey = '';
         currentPlayback.session = session;
@@ -1958,7 +1989,7 @@ async function playAudiobookMessage(msg, button = null, { playbackUiOverride = n
                 session.status = hadPlayableSegment ? 'completed' : 'error';
                 if (!hadPlayableSegment) {
                     Object.assign(audit.audio_played, {
-                        status: 'fail', error: 'all_segments_failed', source: 'message', first_segment_started: false, order_ok: false,
+                        status: 'fail', error: 'all_segments_failed', source, first_segment_started: false, order_ok: false,
                     });
                     audit.last_error = 'all_segments_failed';
                 }
@@ -1997,14 +2028,14 @@ async function playAudiobookMessage(msg, button = null, { playbackUiOverride = n
                 }
                 emitPlaybackState(session, 'playing');
                 Object.assign(audit.audio_played, {
-                    status: 'success', error: null, source: 'message', first_segment_started: true, order_ok: true,
+                    status: 'success', error: null, source, first_segment_started: true, order_ok: true,
                 });
                 prefetch(index);
                 return true;
             } catch (error) {
                 if (!isCurrent()) return false;
                 Object.assign(audit.audio_played, {
-                    status: 'fail', error: error?.message || String(error), source: 'message', first_segment_started: false, order_ok: false,
+                    status: 'fail', error: error?.message || String(error), source, first_segment_started: false, order_ok: false,
                 });
                 audit.last_error = error?.message || String(error);
                 console.warn(`[${extensionName}] playlist play blocked`, error);
@@ -2094,7 +2125,7 @@ async function playAudiobookMessage(msg, button = null, { playbackUiOverride = n
     } catch (error) {
         if (error?.name === 'AbortError' || session?.status === 'cancelled') return;
         Object.assign(audit.audio_played, {
-            status: 'fail', error: error?.message || String(error), source: 'message', first_segment_started: false, order_ok: false,
+            status: 'fail', error: error?.message || String(error), source, first_segment_started: false, order_ok: false,
         });
         audit.last_error = error?.message || String(error);
         console.error(`[${extensionName}] play failed`, error);
@@ -2185,6 +2216,7 @@ function ensureSettingsPanel() {
                     <label class="has-field"><span>角色台词语速 <span id="has-synthesis-speed-value"></span></span><input id="has-synthesis-speed" type="range" min="0.5" max="3" step="0.1"></label>
                     <label class="has-field"><span>旁白语速 <span id="has-speed-value"></span></span><input id="has-speed" type="range" min="0.5" max="3" step="0.1"></label>
                     <label class="has-field"><span>音量 <span id="has-volume-value"></span></span><input id="has-volume" type="range" min="0" max="1" step="0.05"></label>
+                    <label class="checkbox_label has-primary-toggle"><input id="has-auto-play-ai" type="checkbox"><span>AI 回复完成后自动播放</span></label>
                     <label class="checkbox_label"><input id="has-shared-cache" type="checkbox"><span>PC 和手机共用已生成声音</span></label>
                     <div class="has-daily-hint"><i class="fa-solid fa-circle-info" aria-hidden="true"></i><span>回到聊天后，可使用消息右上角按钮朗读整条、选中文字或当前段落；角色台词旁的小耳机只读该句。</span></div>
                 </section>
@@ -3194,6 +3226,7 @@ function syncSettingsPanel(container = document.getElementById('has-settings')) 
     if (!container) return;
     const settings = getSettings();
     container.querySelector('#has-tts-enabled').checked = settings.ttsEnabled !== false;
+    container.querySelector('#has-auto-play-ai').checked = settings.autoPlayAiReplies === true;
     container.querySelector('#has-read-narration').checked = settings.readNarration !== false;
     container.querySelector('#has-shared-cache').checked = settings.sharedAudioCacheEnabled !== false;
     container.querySelector('#has-index-proxy').checked = settings.useServerIndexTtsProxy !== false;
@@ -3302,6 +3335,7 @@ function bindSettingsPanel(container) {
     };
 
     bindCheckbox('#has-tts-enabled', 'ttsEnabled');
+    bindCheckbox('#has-auto-play-ai', 'autoPlayAiReplies', () => seedAutoPlaybackState());
     bindCheckbox('#has-read-narration', 'readNarration', () => {
         const preset = getActivePreset(settings);
         if (preset) preset.mode = settings.readNarration === false ? 'dialogue-only' : 'mixed';
@@ -4314,6 +4348,70 @@ function getPublicPlaybackState() {
     } : { sessionId: null, source: null, status: 'idle', index: 0, total: 0 };
 }
 
+function getAutoPlaybackMessageKey(messageId, messageText = '') {
+    const context = getContext?.();
+    const chatIdentity = String(context?.chatId || context?.groupId || context?.characterId || 'unknown-chat');
+    return `${chatIdentity}:${String(messageId)}:${simpleStringHash(String(messageText || ''))}`;
+}
+
+function seedAutoPlaybackState() {
+    const context = getContext?.();
+    const chat = Array.isArray(context?.chat) ? context.chat : [];
+    for (let messageId = chat.length - 1; messageId >= 0; messageId -= 1) {
+        const message = chat[messageId];
+        if (!message || message.is_user) continue;
+        lastAutoPlayedMessageKey = getAutoPlaybackMessageKey(messageId, message.mes || message.message || '');
+        return;
+    }
+    lastAutoPlayedMessageKey = '';
+}
+
+function findRenderedMessage(messageId) {
+    return Array.from(document.querySelectorAll('.mes'))
+        .find(msg => String(getMessageId(msg)) === String(messageId)) || null;
+}
+
+async function autoPlayAiReply(messageId, messageType = '') {
+    const settings = getSettings();
+    if (settings.ttsEnabled === false || settings.autoPlayAiReplies !== true) return false;
+    if (['first_message', 'extension', 'command'].includes(String(messageType || ''))) return false;
+
+    const context = getContext?.();
+    const chat = Array.isArray(context?.chat) ? context.chat : [];
+    const numericMessageId = Number(messageId);
+    if (!Number.isInteger(numericMessageId) || numericMessageId !== chat.length - 1) return false;
+    const message = chat[numericMessageId];
+    if (!message || message.is_user) return false;
+
+    const messageText = String(message.mes || message.message || '');
+    if (!extractContentBlock(messageText)) return false;
+    const messageKey = getAutoPlaybackMessageKey(numericMessageId, messageText);
+    if (messageKey === lastAutoPlayedMessageKey) return false;
+
+    const msg = findRenderedMessage(numericMessageId);
+    if (!msg || msg.getAttribute('is_user') === 'true') return false;
+    lastAutoPlayedMessageKey = messageKey;
+    await playAudiobookMessage(msg, null, { source: 'auto-message' });
+    return true;
+}
+
+function setupAutoPlaybackEvents() {
+    const previous = window.__hybridAudiobookStageAutoPlaybackHandler;
+    if (previous) eventSource?.removeListener?.(event_types.CHARACTER_MESSAGE_RENDERED, previous);
+    const handler = (messageId, messageType) => {
+        setTimeout(() => {
+            autoPlayAiReply(messageId, messageType).catch(error => {
+                getAudit().last_error = error?.message || String(error);
+                console.warn(`[${extensionName}] automatic reply playback failed`, error);
+            });
+        }, 50);
+    };
+    if (eventSource?.makeLast) eventSource.makeLast(event_types.CHARACTER_MESSAGE_RENDERED, handler);
+    else eventSource?.on?.(event_types.CHARACTER_MESSAGE_RENDERED, handler);
+    window.__hybridAudiobookStageAutoPlaybackHandler = handler;
+    seedAutoPlaybackState();
+}
+
 async function handleIntegrationSpeak(data = {}) {
     Object.assign(getAudit().integration_event, { status: 'success', error: null, last_event: integrationEvents.speak });
     if (String(data.text || '').trim()) {
@@ -4369,6 +4467,7 @@ function init() {
     refreshMessageButtons();
     ensureSelectionSpeakButton();
     setupIntegrationEvents();
+    setupAutoPlaybackEvents();
     document.removeEventListener('selectionchange', captureLatestTextSelection);
     document.addEventListener('selectionchange', captureLatestTextSelection);
     document.removeEventListener('click', handleMessageButtonClick, true);
@@ -4394,6 +4493,7 @@ function init() {
                 inlineDialogueButtonStates.clear();
                 latestTextSelection = { text: '', paragraphText: '', messageId: '', msg: null };
                 document.getElementById('has-selection-speak')?.classList.remove('visible');
+                if (eventType === event_types.CHAT_CHANGED) seedAutoPlaybackState();
             }
             setTimeout(refreshMessageButtons, 50);
         });

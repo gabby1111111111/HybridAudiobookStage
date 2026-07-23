@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
     collectTextSegments,
     extractContentBlock,
+    extractNestedTtsLine,
     normalizeWhitespace,
     parseDialogueLine,
     stripTtsMarkdownMarkers,
@@ -44,6 +45,21 @@ test('parses the existing tagged dialogue format', () => {
         text: '喝一点吧。',
     });
     assert.equal(parseDialogueLine('普通旁白。'), null);
+});
+
+test('extracts nested TTS dialogue from chat bubble wrappers without narrating the wrapper', () => {
+    const wrapped = '[外层昵称|[Alice|温柔][0.1, 0.2] | 「卡片里的台词。」]';
+    assert.equal(extractNestedTtsLine(wrapped), '[Alice|温柔][0.1, 0.2] | 「卡片里的台词。」');
+
+    const result = collectTextSegments(`<content>
+<chat_bubble>${wrapped}</chat_bubble>
+卡片之后的旁白。
+</content>`);
+    assert.deepEqual(result.segments.map(({ type, character, text }) => ({ type, character, text })), [
+        { type: 'dialogue', character: 'Alice', text: '卡片里的台词。' },
+        { type: 'narration', character: 'Narrator', text: '卡片之后的旁白。' },
+    ]);
+    assert.equal(result.segments.some(segment => segment.text.includes('外层昵称')), false);
 });
 
 test('subtracts dialogue ranges and preserves narration/dialogue order', () => {

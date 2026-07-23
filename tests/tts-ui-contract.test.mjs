@@ -37,6 +37,17 @@ test('provider test and preview resolve the visibly selected Profile', () => {
     assert.match(source, /has-profile-preview[\s\S]*?getSelectedProfile\(container, settings\)/);
 });
 
+test('AI reply auto playback is opt-in, shared, deduplicated, and uses rendered character messages', () => {
+    assert.match(source, /autoPlayAiReplies: false/);
+    assert.match(source, /id="has-auto-play-ai"[^>]+type="checkbox"/);
+    assert.match(source, /bindCheckbox\('#has-auto-play-ai', 'autoPlayAiReplies'/);
+    assert.match(source, /event_types\.CHARACTER_MESSAGE_RENDERED/);
+    assert.match(source, /messageKey === lastAutoPlayedMessageKey/);
+    assert.match(source, /numericMessageId !== chat\.length - 1/);
+    assert.match(source, /message\.is_user/);
+    assert.match(source, /source: 'auto-message'/);
+});
+
 test('native Doubao setup stays compact and conditional in the lightweight connection step', () => {
     assert.match(source, /data-testid="has-doubao-quick"[^>]+hidden/);
     assert.match(source, /option value="doubao">豆包原生/);
@@ -133,10 +144,15 @@ test('voice options expose readable primary names and secondary metadata without
     assert.match(style, /\.has-voice-option-meta \{[\s\S]*?overflow-wrap: anywhere;/);
 });
 
-test('single dialogue and exact message selections preserve the full routed segment', () => {
+test('single dialogue preserves its route while general selections bypass only legacy Index overrides', () => {
     assert.match(source, /playLightweightText\(dialogue\.text,[\s\S]*?segment: dialogue/);
     assert.match(source, /sourceMessage = null/);
-    assert.match(source, /collectSegmentsFromMessage\(sourceMessage\)\.segments[\s\S]*?normalizeWhitespace\(item\.text\) === normalizedTarget/);
+    assert.match(source, /sourceSegments[\s\S]*?normalizeWhitespace\(item\.text\) === normalizedTarget[\s\S]*?normalizeWhitespace\(item\.text\)\.includes\(normalizedTarget\)/);
+    assert.match(source, /generalSelectionSource = source === 'selection' \|\| source === 'paragraph'/);
+    assert.match(source, /ignoreCharacterOverrideProfileId: ignoreLegacyCharacterOverride \? LEGACY_OPENAI_PROFILE_ID : ''/);
+    assert.match(source, /legacy_override_bypassed: ignoreLegacyCharacterOverride/);
+    assert.match(source, /preset\?\.mode !== 'single-voice'[\s\S]*?preset\?\.singleVoice\?\.profileId === LEGACY_OPENAI_PROFILE_ID/);
+    assert.match(source, /legacy_single_voice_bypassed: ignoreLegacySingleVoice/);
     assert.match(source, /source: 'selection', sourceMessage:/);
     assert.match(source, /source: 'paragraph', sourceMessage:/);
 });
@@ -203,6 +219,7 @@ test('server cache reads verify existence before downloading audio', () => {
 test('existing settings bindings keep exactly one matching control', () => {
     const requiredIds = [
         'has-tts-enabled', 'has-preset-select', 'has-preset-mode', 'has-profile-select',
+        'has-auto-play-ai',
         'has-profile-test', 'has-provider-status', 'has-profile-preview-text', 'has-profile-preview',
         'has-profile-preview-stop', 'has-synthesis-speed', 'has-speed', 'has-volume',
         'has-shared-cache', 'has-profile-name', 'has-profile-type', 'has-profile-endpoint',

@@ -4,7 +4,7 @@ export function normalizePresetMode(value) {
     return MODES.has(value) ? value : 'mixed';
 }
 
-export function resolveSegmentRoute(segment, preset, profiles) {
+export function resolveSegmentRoute(segment, preset, profiles, { ignoreCharacterOverrideProfileId = '' } = {}) {
     const mode = normalizePresetMode(preset?.mode);
     let target;
     if (mode === 'single-voice' || segment?.type === 'single') {
@@ -12,7 +12,11 @@ export function resolveSegmentRoute(segment, preset, profiles) {
     } else if (segment?.type === 'narration') {
         target = preset?.narration;
     } else {
-        target = preset?.characterOverrides?.[segment?.character] || preset?.dialogueDefault;
+        const characterOverride = preset?.characterOverrides?.[segment?.character];
+        const ignoredProfileId = String(ignoreCharacterOverrideProfileId || '').trim();
+        target = ignoredProfileId && characterOverride?.profileId === ignoredProfileId
+            ? preset?.dialogueDefault
+            : (characterOverride || preset?.dialogueDefault);
     }
 
     const profileId = String(target?.profileId || '').trim();
